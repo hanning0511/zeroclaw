@@ -2776,6 +2776,16 @@ class CiScriptsBehaviorTest(unittest.TestCase):
                     "schema_version": "zeroclaw.canary-policy.v1",
                     "minimum_sample_size": 300,
                     "observation_window_minutes": 60,
+                    "cohorts": [
+                        {"name": "canary-5pct", "traffic_percent": 5, "duration_minutes": 20},
+                        {"name": "canary-20pct", "traffic_percent": 20, "duration_minutes": 20},
+                    ],
+                    "observability_signals": [
+                        "error_rate",
+                        "crash_rate",
+                        "p95_latency_ms",
+                        "sample_size",
+                    ],
                     "thresholds": {
                         "max_error_rate": 0.02,
                         "max_crash_rate": 0.01,
@@ -2818,6 +2828,12 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         report = json.loads(out_json.read_text(encoding="utf-8"))
         self.assertEqual(report["decision"], "promote")
         self.assertTrue(report["ready_to_execute"])
+        self.assertEqual(report["cohorts"][0]["name"], "canary-5pct")
+        self.assertEqual(report["cohorts"][1]["traffic_percent"], 20)
+        self.assertEqual(
+            report["observability_signals"],
+            ["error_rate", "crash_rate", "p95_latency_ms", "sample_size"],
+        )
 
     def test_prerelease_guard_requires_previous_stage(self) -> None:
         repo = self.tmp / "repo"
