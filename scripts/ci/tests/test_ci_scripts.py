@@ -2117,6 +2117,223 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertIn("Blocking vulnerability count parity violation across tags", violations)
         self.assertIn("Artifact ID parity violation across tags", violations)
 
+    def test_docs_deploy_guard_allows_manual_production_rollback_with_preview_evidence(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+        run_cmd(["git", "branch", "-m", "main"], cwd=repo)
+
+        notes = repo / "docs.md"
+        notes.write_text("base\n", encoding="utf-8")
+        run_cmd(["git", "add", "."], cwd=repo)
+        run_cmd(["git", "commit", "-m", "base"], cwd=repo)
+        rollback_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+        notes.write_text("head\n", encoding="utf-8")
+        run_cmd(["git", "commit", "-am", "head"], cwd=repo)
+        head_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+        policy = self.tmp / "docs-deploy-policy.json"
+        policy.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.docs-deploy-policy.v1",
+                    "production_branch": "main",
+                    "allow_manual_production_dispatch": True,
+                    "require_preview_evidence_on_manual_production": True,
+                    "allow_manual_rollback_dispatch": True,
+                    "rollback_ref_must_be_ancestor_of_production_branch": True,
+                    "docs_preview_retention_days": 14,
+                    "docs_guard_artifact_retention_days": 21,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "docs-deploy-guard.json"
+        out_md = self.tmp / "docs-deploy-guard.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("docs_deploy_guard.py"),
+                "--repo-root",
+                str(repo),
+                "--event-name",
+                "workflow_dispatch",
+                "--git-ref",
+                "refs/heads/main",
+                "--git-sha",
+                head_sha,
+                "--input-deploy-target",
+                "production",
+                "--input-preview-evidence-run-url",
+                "https://github.com/zeroclaw-labs/zeroclaw/actions/runs/123",
+                "--input-rollback-ref",
+                rollback_sha,
+                "--policy-file",
+                str(policy),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ],
+            cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertTrue(report["ready"])
+        self.assertEqual(report["deploy_target"], "production")
+        self.assertEqual(report["deploy_mode"], "rollback")
+        self.assertEqual(report["source_ref"], rollback_sha)
+        self.assertEqual(report["violations"], [])
+
+    def test_docs_deploy_guard_requires_preview_evidence_for_manual_production(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+        run_cmd(["git", "branch", "-m", "main"], cwd=repo)
+
+        notes = repo / "docs.md"
+        notes.write_text("head\n", encoding="utf-8")
+        run_cmd(["git", "add", "."], cwd=repo)
+        run_cmd(["git", "commit", "-m", "head"], cwd=repo)
+        head_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+        policy = self.tmp / "docs-deploy-policy.json"
+        policy.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.docs-deploy-policy.v1",
+                    "production_branch": "main",
+                    "allow_manual_production_dispatch": True,
+                    "require_preview_evidence_on_manual_production": True,
+                    "allow_manual_rollback_dispatch": True,
+                    "rollback_ref_must_be_ancestor_of_production_branch": True,
+                    "docs_preview_retention_days": 14,
+                    "docs_guard_artifact_retention_days": 21,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "docs-deploy-guard.missing-preview.json"
+        out_md = self.tmp / "docs-deploy-guard.missing-preview.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("docs_deploy_guard.py"),
+                "--repo-root",
+                str(repo),
+                "--event-name",
+                "workflow_dispatch",
+                "--git-ref",
+                "refs/heads/main",
+                "--git-sha",
+                head_sha,
+                "--input-deploy-target",
+                "production",
+                "--policy-file",
+                str(policy),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ],
+            cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertFalse(report["ready"])
+        self.assertIn("requires `preview_evidence_run_url`", "\n".join(report["violations"]))
+
+    def test_docs_deploy_guard_rejects_non_ancestor_rollback_ref(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        run_cmd(["git", "init"], cwd=repo)
+        run_cmd(["git", "config", "user.name", "Test User"], cwd=repo)
+        run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo)
+        run_cmd(["git", "branch", "-m", "main"], cwd=repo)
+
+        notes = repo / "docs.md"
+        notes.write_text("base\n", encoding="utf-8")
+        run_cmd(["git", "add", "."], cwd=repo)
+        run_cmd(["git", "commit", "-m", "base"], cwd=repo)
+        base_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+        notes.write_text("main-head\n", encoding="utf-8")
+        run_cmd(["git", "commit", "-am", "main-head"], cwd=repo)
+        head_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+        run_cmd(["git", "checkout", "-b", "side", base_sha], cwd=repo)
+        notes.write_text("side-head\n", encoding="utf-8")
+        run_cmd(["git", "commit", "-am", "side-head"], cwd=repo)
+        side_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+        run_cmd(["git", "checkout", "main"], cwd=repo)
+
+        policy = self.tmp / "docs-deploy-policy.json"
+        policy.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.docs-deploy-policy.v1",
+                    "production_branch": "main",
+                    "allow_manual_production_dispatch": True,
+                    "require_preview_evidence_on_manual_production": True,
+                    "allow_manual_rollback_dispatch": True,
+                    "rollback_ref_must_be_ancestor_of_production_branch": True,
+                    "docs_preview_retention_days": 14,
+                    "docs_guard_artifact_retention_days": 21,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "docs-deploy-guard.non-ancestor.json"
+        out_md = self.tmp / "docs-deploy-guard.non-ancestor.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("docs_deploy_guard.py"),
+                "--repo-root",
+                str(repo),
+                "--event-name",
+                "workflow_dispatch",
+                "--git-ref",
+                "refs/heads/main",
+                "--git-sha",
+                head_sha,
+                "--input-deploy-target",
+                "production",
+                "--input-preview-evidence-run-url",
+                "https://github.com/zeroclaw-labs/zeroclaw/actions/runs/123",
+                "--input-rollback-ref",
+                side_sha,
+                "--policy-file",
+                str(policy),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ],
+            cwd=repo,
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertFalse(report["ready"])
+        self.assertIn("is not an ancestor", "\n".join(report["violations"]))
+
     def test_release_artifact_guard_detects_missing_archives_in_verify_stage(self) -> None:
         artifacts = self.tmp / "artifacts"
         artifacts.mkdir(parents=True, exist_ok=True)
