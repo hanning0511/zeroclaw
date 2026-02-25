@@ -1697,6 +1697,173 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertGreaterEqual(len(report["files"]), 3)
         self.assertIn("zeroclaw-x86_64-unknown-linux-gnu.tar.gz", checksums.read_text(encoding="utf-8"))
 
+    def test_release_artifact_guard_detects_missing_archives_in_verify_stage(self) -> None:
+        artifacts = self.tmp / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        (artifacts / "zeroclaw-x86_64-unknown-linux-gnu.tar.gz").write_bytes(b"linux-gnu")
+
+        contract = self.tmp / "artifact-contract.json"
+        contract.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.release-artifact-contract.v1",
+                    "release_archive_patterns": [
+                        "zeroclaw-x86_64-unknown-linux-gnu.tar.gz",
+                        "zeroclaw-x86_64-unknown-linux-musl.tar.gz",
+                    ],
+                    "required_manifest_files": [
+                        "release-manifest.json",
+                        "release-manifest.md",
+                        "SHA256SUMS",
+                    ],
+                    "required_sbom_files": ["zeroclaw.cdx.json", "zeroclaw.spdx.json"],
+                    "required_notice_files": ["LICENSE-APACHE", "LICENSE-MIT", "NOTICE"],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "release-artifact-guard.verify.json"
+        out_md = self.tmp / "release-artifact-guard.verify.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("release_artifact_guard.py"),
+                "--artifacts-dir",
+                str(artifacts),
+                "--contract-file",
+                str(contract),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--allow-extra-archives",
+                "--skip-manifest-files",
+                "--skip-sbom-files",
+                "--skip-notice-files",
+                "--fail-on-violation",
+            ]
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        joined = "\n".join(report["violations"])
+        self.assertIn("Missing release archives", joined)
+        self.assertTrue(report["categories"]["manifest_files"]["skipped"])
+        self.assertTrue(report["categories"]["sbom_files"]["skipped"])
+        self.assertTrue(report["categories"]["notice_files"]["skipped"])
+
+    def test_release_artifact_guard_passes_for_full_publish_contract(self) -> None:
+        artifacts = self.tmp / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        (artifacts / "zeroclaw-x86_64-unknown-linux-gnu.tar.gz").write_bytes(b"linux-gnu")
+        (artifacts / "zeroclaw-x86_64-unknown-linux-musl.tar.gz").write_bytes(b"linux-musl")
+        (artifacts / "release-manifest.json").write_text('{"ok":true}\n', encoding="utf-8")
+        (artifacts / "release-manifest.md").write_text("# ok\n", encoding="utf-8")
+        (artifacts / "SHA256SUMS").write_text("abc  file\n", encoding="utf-8")
+        (artifacts / "zeroclaw.cdx.json").write_text('{"sbom":"cdx"}\n', encoding="utf-8")
+        (artifacts / "zeroclaw.spdx.json").write_text('{"sbom":"spdx"}\n', encoding="utf-8")
+        (artifacts / "LICENSE-APACHE").write_text("license\n", encoding="utf-8")
+        (artifacts / "LICENSE-MIT").write_text("license\n", encoding="utf-8")
+        (artifacts / "NOTICE").write_text("notice\n", encoding="utf-8")
+        (artifacts / "zeroclaw-x86_64-unknown-linux-gnu.tar.gz.sig").write_text("sig\n", encoding="utf-8")
+
+        contract = self.tmp / "artifact-contract.json"
+        contract.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.release-artifact-contract.v1",
+                    "release_archive_patterns": [
+                        "zeroclaw-x86_64-unknown-linux-gnu.tar.gz",
+                        "zeroclaw-x86_64-unknown-linux-musl.tar.gz",
+                    ],
+                    "required_manifest_files": [
+                        "release-manifest.json",
+                        "release-manifest.md",
+                        "SHA256SUMS",
+                    ],
+                    "required_sbom_files": ["zeroclaw.cdx.json", "zeroclaw.spdx.json"],
+                    "required_notice_files": ["LICENSE-APACHE", "LICENSE-MIT", "NOTICE"],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "release-artifact-guard.publish.json"
+        out_md = self.tmp / "release-artifact-guard.publish.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("release_artifact_guard.py"),
+                "--artifacts-dir",
+                str(artifacts),
+                "--contract-file",
+                str(contract),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--allow-extra-archives",
+                "--allow-extra-manifest-files",
+                "--allow-extra-sbom-files",
+                "--allow-extra-notice-files",
+                "--fail-on-violation",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertTrue(report["ready"])
+        self.assertEqual(report["violations"], [])
+
+    def test_release_artifact_guard_rejects_invalid_contract_schema(self) -> None:
+        artifacts = self.tmp / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        (artifacts / "zeroclaw-x86_64-unknown-linux-gnu.tar.gz").write_bytes(b"linux-gnu")
+
+        contract = self.tmp / "artifact-contract.json"
+        contract.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.release-artifact-contract.v0",
+                    "release_archive_patterns": ["zeroclaw-x86_64-unknown-linux-gnu.tar.gz"],
+                    "required_manifest_files": ["release-manifest.json"],
+                    "required_sbom_files": ["zeroclaw.cdx.json"],
+                    "required_notice_files": ["NOTICE"],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "release-artifact-guard.invalid-schema.json"
+        out_md = self.tmp / "release-artifact-guard.invalid-schema.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("release_artifact_guard.py"),
+                "--artifacts-dir",
+                str(artifacts),
+                "--contract-file",
+                str(contract),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--allow-extra-archives",
+                "--skip-manifest-files",
+                "--skip-sbom-files",
+                "--skip-notice-files",
+                "--fail-on-violation",
+            ]
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertIn("schema_version", "\n".join(report["violations"]))
+
     def test_release_trigger_guard_allows_authorized_actor_and_tagger(self) -> None:
         repo = self.tmp / "repo"
         repo.mkdir(parents=True, exist_ok=True)
