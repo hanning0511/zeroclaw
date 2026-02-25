@@ -1802,6 +1802,141 @@ class CiScriptsBehaviorTest(unittest.TestCase):
             "\n".join(report["violations"]),
         )
 
+    def test_ghcr_publish_contract_guard_passes_with_matching_digests(self) -> None:
+        policy = self.tmp / "ghcr-tag-policy.json"
+        policy.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.ghcr-tag-policy.v1",
+                    "release_tag_regex": "^v[0-9]+\\.[0-9]+\\.[0-9]+$",
+                    "sha_tag_prefix": "sha-",
+                    "sha_tag_length": 12,
+                    "latest_tag": "latest",
+                    "require_latest_on_release": True,
+                    "immutable_tag_classes": ["release", "sha"],
+                    "rollback_priority": ["sha", "release"],
+                    "contract_artifact_retention_days": 21,
+                    "scan_artifact_retention_days": 14,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        snapshot = self.tmp / "ghcr-snapshot.json"
+        snapshot.write_text(
+            json.dumps(
+                {
+                    "tags": {
+                        "v1.2.3": {"status_code": 200, "digest": "sha256:abc123"},
+                        "sha-abcdef123456": {"status_code": 200, "digest": "sha256:abc123"},
+                        "latest": {"status_code": 200, "digest": "sha256:abc123"},
+                    }
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "ghcr-publish-contract.json"
+        out_md = self.tmp / "ghcr-publish-contract.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("ghcr_publish_contract_guard.py"),
+                "--repository",
+                "zeroclaw-labs/zeroclaw",
+                "--release-tag",
+                "v1.2.3",
+                "--sha",
+                "abcdef1234567890abcdef1234567890abcdef12",
+                "--policy-file",
+                str(policy),
+                "--manifest-snapshot-file",
+                str(snapshot),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertTrue(report["ready"])
+        self.assertEqual(report["violations"], [])
+        self.assertEqual(report["rollback_candidates"], ["sha-abcdef123456", "v1.2.3"])
+
+    def test_ghcr_publish_contract_guard_detects_digest_parity_violation(self) -> None:
+        policy = self.tmp / "ghcr-tag-policy.json"
+        policy.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.ghcr-tag-policy.v1",
+                    "release_tag_regex": "^v[0-9]+\\.[0-9]+\\.[0-9]+$",
+                    "sha_tag_prefix": "sha-",
+                    "sha_tag_length": 12,
+                    "latest_tag": "latest",
+                    "require_latest_on_release": True,
+                    "immutable_tag_classes": ["release", "sha"],
+                    "rollback_priority": ["sha", "release"],
+                    "contract_artifact_retention_days": 21,
+                    "scan_artifact_retention_days": 14,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        snapshot = self.tmp / "ghcr-snapshot.mismatch.json"
+        snapshot.write_text(
+            json.dumps(
+                {
+                    "tags": {
+                        "v1.2.3": {"status_code": 200, "digest": "sha256:111"},
+                        "sha-abcdef123456": {"status_code": 200, "digest": "sha256:222"},
+                        "latest": {"status_code": 200, "digest": "sha256:333"},
+                    }
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "ghcr-publish-contract.mismatch.json"
+        out_md = self.tmp / "ghcr-publish-contract.mismatch.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("ghcr_publish_contract_guard.py"),
+                "--repository",
+                "zeroclaw-labs/zeroclaw",
+                "--release-tag",
+                "v1.2.3",
+                "--sha",
+                "abcdef1234567890abcdef1234567890abcdef12",
+                "--policy-file",
+                str(policy),
+                "--manifest-snapshot-file",
+                str(snapshot),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ]
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertFalse(report["ready"])
+        violations = "\n".join(report["violations"])
+        self.assertIn("release tag digest does not match immutable sha tag digest", violations)
+        self.assertIn("latest tag digest does not match release tag digest", violations)
+
     def test_release_artifact_guard_detects_missing_archives_in_verify_stage(self) -> None:
         artifacts = self.tmp / "artifacts"
         artifacts.mkdir(parents=True, exist_ok=True)
