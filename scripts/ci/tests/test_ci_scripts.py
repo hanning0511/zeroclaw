@@ -1937,6 +1937,186 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertIn("release tag digest does not match immutable sha tag digest", violations)
         self.assertIn("latest tag digest does not match release tag digest", violations)
 
+    def test_ghcr_vulnerability_gate_passes_when_blocking_findings_are_zero(self) -> None:
+        policy = self.tmp / "ghcr-vulnerability-policy.json"
+        policy.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.ghcr-vulnerability-policy.v1",
+                    "required_tag_classes": ["release", "sha", "latest"],
+                    "blocking_severities": ["HIGH", "CRITICAL"],
+                    "max_blocking_findings_per_tag": 0,
+                    "require_blocking_count_parity": True,
+                    "require_artifact_id_parity": True,
+                    "scan_artifact_retention_days": 14,
+                    "audit_artifact_retention_days": 21,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        release_report = self.tmp / "trivy-v1.2.3.json"
+        sha_report = self.tmp / "trivy-sha-abcdef123456.json"
+        latest_report = self.tmp / "trivy-latest.json"
+        shared_report = {
+            "ArtifactID": "sha256:deadbeef",
+            "Results": [
+                {
+                    "Target": "alpine:3.20",
+                    "Type": "os",
+                    "Vulnerabilities": [
+                        {
+                            "VulnerabilityID": "CVE-2026-0001",
+                            "Severity": "MEDIUM",
+                        }
+                    ],
+                }
+            ],
+        }
+        release_report.write_text(json.dumps(shared_report, indent=2) + "\n", encoding="utf-8")
+        sha_report.write_text(json.dumps(shared_report, indent=2) + "\n", encoding="utf-8")
+        latest_report.write_text(json.dumps(shared_report, indent=2) + "\n", encoding="utf-8")
+
+        out_json = self.tmp / "ghcr-vulnerability-gate.json"
+        out_md = self.tmp / "ghcr-vulnerability-gate.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("ghcr_vulnerability_gate.py"),
+                "--release-tag",
+                "v1.2.3",
+                "--sha-tag",
+                "sha-abcdef123456",
+                "--latest-tag",
+                "latest",
+                "--release-report-json",
+                str(release_report),
+                "--sha-report-json",
+                str(sha_report),
+                "--latest-report-json",
+                str(latest_report),
+                "--policy-file",
+                str(policy),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertTrue(report["ready"])
+        self.assertEqual(report["violations"], [])
+        self.assertEqual(report["reports"]["release"]["blocking_vulnerabilities"], 0)
+        self.assertEqual(report["reports"]["sha"]["blocking_vulnerabilities"], 0)
+        self.assertEqual(report["reports"]["latest"]["blocking_vulnerabilities"], 0)
+
+    def test_ghcr_vulnerability_gate_fails_on_blocking_and_parity_violations(self) -> None:
+        policy = self.tmp / "ghcr-vulnerability-policy.json"
+        policy.write_text(
+            json.dumps(
+                {
+                    "schema_version": "zeroclaw.ghcr-vulnerability-policy.v1",
+                    "required_tag_classes": ["release", "sha", "latest"],
+                    "blocking_severities": ["HIGH", "CRITICAL"],
+                    "max_blocking_findings_per_tag": 0,
+                    "require_blocking_count_parity": True,
+                    "require_artifact_id_parity": True,
+                    "scan_artifact_retention_days": 14,
+                    "audit_artifact_retention_days": 21,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        release_report = self.tmp / "trivy-v1.2.3.json"
+        sha_report = self.tmp / "trivy-sha-abcdef123456.json"
+        latest_report = self.tmp / "trivy-latest.json"
+        release_report.write_text(
+            json.dumps(
+                {
+                    "ArtifactID": "sha256:image-a",
+                    "Results": [
+                        {
+                            "Target": "alpine:3.20",
+                            "Type": "os",
+                            "Vulnerabilities": [
+                                {
+                                    "VulnerabilityID": "CVE-2026-9999",
+                                    "Severity": "CRITICAL",
+                                }
+                            ],
+                        }
+                    ],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        sha_report.write_text(
+            json.dumps(
+                {
+                    "ArtifactID": "sha256:image-b",
+                    "Results": [{"Target": "alpine:3.20", "Type": "os", "Vulnerabilities": []}],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        latest_report.write_text(
+            json.dumps(
+                {
+                    "ArtifactID": "sha256:image-a",
+                    "Results": [{"Target": "alpine:3.20", "Type": "os", "Vulnerabilities": []}],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out_json = self.tmp / "ghcr-vulnerability-gate.fail.json"
+        out_md = self.tmp / "ghcr-vulnerability-gate.fail.md"
+        proc = run_cmd(
+            [
+                "python3",
+                self._script("ghcr_vulnerability_gate.py"),
+                "--release-tag",
+                "v1.2.3",
+                "--sha-tag",
+                "sha-abcdef123456",
+                "--latest-tag",
+                "latest",
+                "--release-report-json",
+                str(release_report),
+                "--sha-report-json",
+                str(sha_report),
+                "--latest-report-json",
+                str(latest_report),
+                "--policy-file",
+                str(policy),
+                "--output-json",
+                str(out_json),
+                "--output-md",
+                str(out_md),
+                "--fail-on-violation",
+            ]
+        )
+        self.assertEqual(proc.returncode, 3)
+        report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertFalse(report["ready"])
+        violations = "\n".join(report["violations"])
+        self.assertIn("Blocking vulnerabilities for `release`", violations)
+        self.assertIn("Blocking vulnerability count parity violation across tags", violations)
+        self.assertIn("Artifact ID parity violation across tags", violations)
+
     def test_release_artifact_guard_detects_missing_archives_in_verify_stage(self) -> None:
         artifacts = self.tmp / "artifacts"
         artifacts.mkdir(parents=True, exist_ok=True)
