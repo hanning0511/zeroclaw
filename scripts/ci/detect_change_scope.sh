@@ -24,6 +24,7 @@ if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
     echo "docs_changed=false"
     echo "rust_changed=true"
     echo "workflow_changed=false"
+    echo "ci_cd_changed=false"
     echo "base_sha="
   } >> "$GITHUB_OUTPUT"
   write_empty_docs_files
@@ -59,6 +60,7 @@ if [ -z "$CHANGED" ]; then
     echo "docs_changed=false"
     echo "rust_changed=false"
     echo "workflow_changed=false"
+    echo "ci_cd_changed=false"
     echo "base_sha=$DIFF_BASE"
   } >> "$GITHUB_OUTPUT"
   write_empty_docs_files
@@ -69,12 +71,27 @@ docs_only=true
 docs_changed=false
 rust_changed=false
 workflow_changed=false
+ci_cd_changed=false
 docs_files=()
 while IFS= read -r file; do
   [ -z "$file" ] && continue
 
   if [[ "$file" == .github/workflows/* ]]; then
     workflow_changed=true
+  fi
+
+  if [[ "$file" == .github/workflows/* ]] \
+    || [[ "$file" == .github/codeql/* ]] \
+    || [[ "$file" == .github/connectivity/* ]] \
+    || [[ "$file" == .github/release/* ]] \
+    || [[ "$file" == .github/security/* ]] \
+    || [[ "$file" == .github/actionlint.yaml ]] \
+    || [[ "$file" == .github/dependabot.yml ]] \
+    || [[ "$file" == scripts/ci/* ]] \
+    || [[ "$file" == docs/ci-map.md ]] \
+    || [[ "$file" == docs/actions-source-policy.md ]] \
+    || [[ "$file" == docs/operations/self-hosted-runner-remediation.md ]]; then
+    ci_cd_changed=true
   fi
 
   if [[ "$file" == docs/* ]] \
@@ -110,6 +127,7 @@ done <<< "$CHANGED"
   echo "docs_changed=$docs_changed"
   echo "rust_changed=$rust_changed"
   echo "workflow_changed=$workflow_changed"
+  echo "ci_cd_changed=$ci_cd_changed"
   echo "base_sha=$DIFF_BASE"
   echo "docs_files<<EOF"
   printf '%s\n' "${docs_files[@]}"
