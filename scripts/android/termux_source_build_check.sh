@@ -3,15 +3,20 @@ set -euo pipefail
 
 TARGET="aarch64-linux-android"
 RUN_CARGO_CHECK=0
+MODE="auto"
 
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/android/termux_source_build_check.sh [--target <triple>] [--run-cargo-check]
+  scripts/android/termux_source_build_check.sh [--target <triple>] [--mode <auto|termux-native|ndk-cross>] [--run-cargo-check]
 
 Options:
   --target <triple>    Android Rust target (default: aarch64-linux-android)
                        Supported: aarch64-linux-android, armv7-linux-androideabi
+  --mode <mode>        Validation mode:
+                       auto (default): infer from environment
+                       termux-native: expect plain clang + no cross overrides
+                       ndk-cross: expect NDK wrapper linker + matching CC_*
   --run-cargo-check    Run cargo check --locked --target <triple> --no-default-features
   -h, --help           Show this help
 
@@ -47,6 +52,11 @@ while [[ $# -gt 0 ]]; do
       RUN_CARGO_CHECK=1
       shift
       ;;
+    --mode)
+      [[ $# -ge 2 ]] || die "--mode requires a value"
+      MODE="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -64,6 +74,13 @@ case "$TARGET" in
     ;;
 esac
 
+case "$MODE" in
+  auto|termux-native|ndk-cross) ;;
+  *)
+    die "unsupported mode '$MODE' (expected auto, termux-native, or ndk-cross)"
+    ;;
+esac
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" >/dev/null 2>&1 && pwd || pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." >/dev/null 2>&1 && pwd || pwd)"
 CONFIG_FILE="$REPO_ROOT/.cargo/config.toml"
@@ -77,6 +94,15 @@ CC_LINKER_VAR="CC_${TARGET_UNDERSCORE}"
 is_termux=0
 if [[ -n "${TERMUX_VERSION:-}" ]] || [[ "${PREFIX:-}" == *"/com.termux/files/usr"* ]]; then
   is_termux=1
+fi
+
+effective_mode="$MODE"
+if [[ "$effective_mode" == "auto" ]]; then
+  if [[ "$is_termux" -eq 1 ]]; then
+    effective_mode="termux-native"
+  else
+    effective_mode="ndk-cross"
+  fi
 fi
 
 extract_linker_from_config() {
@@ -108,10 +134,11 @@ is_executable_tool() {
 log "repo: $REPO_ROOT"
 log "target: $TARGET"
 if [[ "$is_termux" -eq 1 ]]; then
-  log "environment: Termux/native"
+  log "environment: Termux detected"
 else
   log "environment: non-Termux (likely desktop/CI)"
 fi
+log "mode: $effective_mode"
 
 command_exists rustup || die "rustup is not installed"
 command_exists cargo || die "cargo is not installed"
@@ -140,7 +167,7 @@ fi
 effective_linker="${cargo_linker_override:-${config_linker:-clang}}"
 log "effective linker: $effective_linker"
 
-if [[ "$is_termux" -eq 1 ]]; then
+if [[ "$effective_mode" == "termux-native" ]]; then
   command_exists clang || die "clang is required in Termux. Run: pkg install -y clang pkg-config"
 
   if [[ "${config_linker:-}" != "clang" ]]; then
@@ -153,14 +180,35 @@ if [[ "$is_termux" -eq 1 ]]; then
   if [[ -n "$cc_linker_override" && "$cc_linker_override" != "clang" ]]; then
     warn "Termux native build usually should unset $CC_LINKER_VAR (currently '$cc_linker_override')"
   fi
+
+  log "suggested fixups (termux-native):"
+  log "  unset $CARGO_LINKER_VAR"
+  log "  unset $CC_LINKER_VAR"
+  log "  command -v clang"
 else
   if [[ -n "$cargo_linker_override" && -z "$cc_linker_override" ]]; then
     warn "cross-build may still fail in cc-rs crates; consider setting $CC_LINKER_VAR=$cargo_linker_override"
   fi
+
+  if [[ -n "$cargo_linker_override" ]]; then
+    log "suggested fixup (ndk-cross):"
+    log "  export $CC_LINKER_VAR=\"$cargo_linker_override\""
+  else
+    warn "NDK cross mode expects $CARGO_LINKER_VAR to point to an NDK clang wrapper"
+    log "suggested fixup template (ndk-cross):"
+    log "  export NDK_TOOLCHAIN=\"\$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin\""
+    if [[ "$TARGET" == "aarch64-linux-android" ]]; then
+      log "  export $CARGO_LINKER_VAR=\"\$NDK_TOOLCHAIN/aarch64-linux-android21-clang\""
+      log "  export $CC_LINKER_VAR=\"\$NDK_TOOLCHAIN/aarch64-linux-android21-clang\""
+    else
+      log "  export $CARGO_LINKER_VAR=\"\$NDK_TOOLCHAIN/armv7a-linux-androideabi21-clang\""
+      log "  export $CC_LINKER_VAR=\"\$NDK_TOOLCHAIN/armv7a-linux-androideabi21-clang\""
+    fi
+  fi
 fi
 
 if ! is_executable_tool "$effective_linker"; then
-  if [[ "$is_termux" -eq 1 ]]; then
+  if [[ "$effective_mode" == "termux-native" ]]; then
     die "effective linker '$effective_linker' is not executable in PATH"
   fi
   warn "effective linker '$effective_linker' not found (expected for some desktop hosts without NDK toolchain)"
