@@ -20,6 +20,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 SCRIPTS_DIR = ROOT / "scripts" / "ci"
+ANDROID_SCRIPTS_DIR = ROOT / "scripts" / "android"
 
 
 def run_cmd(
@@ -91,6 +92,244 @@ class CiScriptsBehaviorTest(unittest.TestCase):
 
     def _script(self, name: str) -> str:
         return str(SCRIPTS_DIR / name)
+
+    def _android_script(self, name: str) -> str:
+        return str(ANDROID_SCRIPTS_DIR / name)
+
+    def test_android_selfcheck_help_mentions_modes(self) -> None:
+        proc = run_cmd(["bash", self._android_script("termux_source_build_check.sh"), "--help"])
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        self.assertIn("--mode <auto|termux-native|ndk-cross>", proc.stdout)
+        self.assertIn("--diagnose-log <p>", proc.stdout)
+        self.assertIn("--json-output <p|-]", proc.stdout)
+        self.assertIn("--quiet", proc.stdout)
+        self.assertIn("--strict", proc.stdout)
+
+    def test_android_selfcheck_diagnose_log_ndk_cross(self) -> None:
+        log_path = self.tmp / "android-failure.log"
+        log_path.write_text(
+            textwrap.dedent(
+                """
+                error occurred in cc-rs: failed to find tool "aarch64-linux-android-clang": No such file or directory (os error 2)
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        proc = run_cmd(
+            [
+                "bash",
+                self._android_script("termux_source_build_check.sh"),
+                "--target",
+                "aarch64-linux-android",
+                "--mode",
+                "ndk-cross",
+                "--diagnose-log",
+                str(log_path),
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        combined = f"{proc.stdout}\n{proc.stderr}"
+        self.assertIn("detected cc-rs compiler lookup failure", combined)
+        self.assertIn("export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER", combined)
+        self.assertIn("export CC_aarch64_linux_android", combined)
+
+    def test_android_selfcheck_diagnose_log_termux_native(self) -> None:
+        log_path = self.tmp / "android-failure-termux.log"
+        log_path.write_text(
+            textwrap.dedent(
+                """
+                error occurred in cc-rs: failed to find tool "aarch64-linux-android-clang": No such file or directory (os error 2)
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        proc = run_cmd(
+            [
+                "bash",
+                self._android_script("termux_source_build_check.sh"),
+                "--target",
+                "aarch64-linux-android",
+                "--mode",
+                "termux-native",
+                "--diagnose-log",
+                str(log_path),
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        combined = f"{proc.stdout}\n{proc.stderr}"
+        self.assertIn("suggested recovery (termux-native)", combined)
+        self.assertIn("unset CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER", combined)
+
+    def test_android_selfcheck_json_output_on_diagnose_success(self) -> None:
+        log_path = self.tmp / "android-failure-json.log"
+        json_path = self.tmp / "android-selfcheck.json"
+        log_path.write_text(
+            textwrap.dedent(
+                """
+                error occurred in cc-rs: failed to find tool "aarch64-linux-android-clang": No such file or directory (os error 2)
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        proc = run_cmd(
+            [
+                "bash",
+                self._android_script("termux_source_build_check.sh"),
+                "--target",
+                "aarch64-linux-android",
+                "--mode",
+                "ndk-cross",
+                "--diagnose-log",
+                str(log_path),
+                "--json-output",
+                str(json_path),
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(json_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["schema_version"], "zeroclaw.android-selfcheck.v1")
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["error_code"], "NONE")
+        self.assertFalse(report["strict_mode"])
+        self.assertEqual(report["target"], "aarch64-linux-android")
+        self.assertEqual(report["mode_effective"], "ndk-cross")
+        self.assertTrue(any("cc-rs compiler lookup failure" in x for x in report["detections"]))
+        self.assertIn("CC_RS_TOOL_NOT_FOUND", report["detection_codes"])
+        self.assertTrue(any("CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER" in x for x in report["suggestions"]))
+
+    def test_android_selfcheck_json_output_on_missing_diagnose_log(self) -> None:
+        missing_log = self.tmp / "missing.log"
+        json_path = self.tmp / "android-selfcheck-error.json"
+        proc = run_cmd(
+            [
+                "bash",
+                self._android_script("termux_source_build_check.sh"),
+                "--target",
+                "aarch64-linux-android",
+                "--mode",
+                "ndk-cross",
+                "--diagnose-log",
+                str(missing_log),
+                "--json-output",
+                str(json_path),
+            ]
+        )
+        self.assertEqual(proc.returncode, 1)
+        report = json.loads(json_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["status"], "error")
+        self.assertEqual(report["exit_code"], 1)
+        self.assertEqual(report["error_code"], "MISSING_DIAGNOSE_LOG")
+        self.assertIn("does not exist", report["error_message"])
+
+    def test_android_selfcheck_json_stdout_mode(self) -> None:
+        log_path = self.tmp / "android-failure-stdout.log"
+        log_path.write_text(
+            textwrap.dedent(
+                """
+                error occurred in cc-rs: failed to find tool "aarch64-linux-android-clang": No such file or directory (os error 2)
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        proc = run_cmd(
+            [
+                "bash",
+                self._android_script("termux_source_build_check.sh"),
+                "--target",
+                "aarch64-linux-android",
+                "--mode",
+                "ndk-cross",
+                "--diagnose-log",
+                str(log_path),
+                "--json-output",
+                "-",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(proc.stdout)
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["mode_effective"], "ndk-cross")
+
+    def test_android_selfcheck_strict_fails_when_warnings_present(self) -> None:
+        log_path = self.tmp / "android-failure-strict.log"
+        json_path = self.tmp / "android-selfcheck-strict-error.json"
+        log_path.write_text(
+            textwrap.dedent(
+                """
+                error occurred in cc-rs: failed to find tool "aarch64-linux-android-clang": No such file or directory (os error 2)
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        proc = run_cmd(
+            [
+                "bash",
+                self._android_script("termux_source_build_check.sh"),
+                "--target",
+                "aarch64-linux-android",
+                "--mode",
+                "ndk-cross",
+                "--diagnose-log",
+                str(log_path),
+                "--json-output",
+                str(json_path),
+                "--strict",
+            ]
+        )
+        self.assertEqual(proc.returncode, 1)
+        report = json.loads(json_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["status"], "error")
+        self.assertEqual(report["error_code"], "STRICT_WARNINGS")
+        self.assertTrue(report["strict_mode"])
+        self.assertGreater(report["warning_count"], 0)
+
+    def test_android_selfcheck_strict_passes_without_warnings(self) -> None:
+        log_path = self.tmp / "android-clean-strict.log"
+        json_path = self.tmp / "android-selfcheck-strict-ok.json"
+        log_path.write_text("build completed cleanly\n", encoding="utf-8")
+        proc = run_cmd(
+            [
+                "bash",
+                self._android_script("termux_source_build_check.sh"),
+                "--target",
+                "aarch64-linux-android",
+                "--mode",
+                "ndk-cross",
+                "--diagnose-log",
+                str(log_path),
+                "--json-output",
+                str(json_path),
+                "--strict",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(json_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["error_code"], "NONE")
+        self.assertEqual(report["warning_count"], 0)
+        self.assertTrue(report["strict_mode"])
+
+    def test_android_selfcheck_bad_argument_reports_error_code(self) -> None:
+        json_path = self.tmp / "android-selfcheck-bad-arg.json"
+        proc = run_cmd(
+            [
+                "bash",
+                self._android_script("termux_source_build_check.sh"),
+                "--mode",
+                "invalid-mode",
+                "--json-output",
+                str(json_path),
+            ]
+        )
+        self.assertEqual(proc.returncode, 1)
+        report = json.loads(json_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["status"], "error")
+        self.assertEqual(report["error_code"], "BAD_ARGUMENT")
 
     def test_emit_audit_event_envelope(self) -> None:
         payload_path = self.tmp / "payload.json"
