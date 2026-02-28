@@ -131,6 +131,62 @@ is_executable_tool() {
   fi
 }
 
+ndk_wrapper_for_target() {
+  case "$TARGET" in
+    aarch64-linux-android) printf '%s\n' "aarch64-linux-android21-clang" ;;
+    armv7-linux-androideabi) printf '%s\n' "armv7a-linux-androideabi21-clang" ;;
+    *) printf '%s\n' "" ;;
+  esac
+}
+
+diagnose_cargo_failure() {
+  local log_file="$1"
+  local ndk_wrapper
+  ndk_wrapper="$(ndk_wrapper_for_target)"
+
+  log "cargo check failed; analyzing common Android toolchain issues..."
+
+  if grep -Eq 'failed to find tool "aarch64-linux-android-clang"|failed to find tool "armv7a-linux-androideabi-clang"|ToolNotFound' "$log_file"; then
+    warn "detected cc-rs compiler lookup failure for Android target"
+    if [[ "$effective_mode" == "termux-native" ]]; then
+      log "suggested recovery (termux-native):"
+      log "  unset $CARGO_LINKER_VAR"
+      log "  unset $CC_LINKER_VAR"
+      log "  pkg install -y clang pkg-config"
+      log "  command -v clang"
+    else
+      log "suggested recovery (ndk-cross):"
+      log "  export NDK_TOOLCHAIN=\"\$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin\""
+      log "  export $CARGO_LINKER_VAR=\"\$NDK_TOOLCHAIN/$ndk_wrapper\""
+      log "  export $CC_LINKER_VAR=\"\$NDK_TOOLCHAIN/$ndk_wrapper\""
+      log "  command -v \"\$NDK_TOOLCHAIN/$ndk_wrapper\""
+    fi
+  fi
+
+  if grep -Eq 'linker `clang` not found|linker .* not found|cannot find linker|failed to find tool "clang"' "$log_file"; then
+    warn "detected linker resolution failure"
+    if [[ "$effective_mode" == "termux-native" ]]; then
+      log "suggested recovery (termux-native):"
+      log "  pkg install -y clang pkg-config"
+      log "  command -v clang"
+    else
+      log "suggested recovery (ndk-cross):"
+      log "  export $CARGO_LINKER_VAR=\"\$NDK_TOOLCHAIN/$ndk_wrapper\""
+      log "  export $CC_LINKER_VAR=\"\$NDK_TOOLCHAIN/$ndk_wrapper\""
+    fi
+  fi
+
+  if grep -Eq "target '$TARGET' not found|can't find crate for std|did you mean to run rustup target add" "$log_file"; then
+    warn "detected missing Rust target stdlib"
+    log "suggested recovery:"
+    log "  rustup target add $TARGET"
+  fi
+
+  if grep -Eq 'No such file or directory \(os error 2\)' "$log_file"; then
+    warn "detected missing binary/file in build chain; verify linker and CC_* variables point to real executables"
+  fi
+}
+
 log "repo: $REPO_ROOT"
 log "target: $TARGET"
 if [[ "$is_termux" -eq 1 ]]; then
@@ -215,9 +271,24 @@ if ! is_executable_tool "$effective_linker"; then
 fi
 
 if [[ "$RUN_CARGO_CHECK" -eq 1 ]]; then
+  tmp_log="$(mktemp -t zeroclaw-android-check-XXXXXX.log)"
+  cleanup_tmp_log() {
+    rm -f "$tmp_log"
+  }
+  trap cleanup_tmp_log EXIT
+
   log "running cargo check --locked --target $TARGET --no-default-features"
+  set +e
   CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/zeroclaw-android-selfcheck-target}" \
-    cargo check --locked --target "$TARGET" --no-default-features
+    cargo check --locked --target "$TARGET" --no-default-features 2>&1 | tee "$tmp_log"
+  cargo_status="${PIPESTATUS[0]}"
+  set -e
+
+  if [[ "$cargo_status" -ne 0 ]]; then
+    diagnose_cargo_failure "$tmp_log"
+    die "cargo check failed (exit $cargo_status)"
+  fi
+
   log "cargo check completed successfully"
 else
   log "skip cargo check (use --run-cargo-check to enable)"
