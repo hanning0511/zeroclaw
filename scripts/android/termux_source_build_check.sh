@@ -7,6 +7,7 @@ MODE="auto"
 DIAGNOSE_LOG=""
 JSON_OUTPUT=""
 QUIET=0
+STRICT=0
 ERROR_MESSAGE=""
 ERROR_CODE="NONE"
 config_linker=""
@@ -22,7 +23,7 @@ DETECTION_CODES=()
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/android/termux_source_build_check.sh [--target <triple>] [--mode <auto|termux-native|ndk-cross>] [--run-cargo-check] [--diagnose-log <path>] [--json-output <path|-] [--quiet]
+  scripts/android/termux_source_build_check.sh [--target <triple>] [--mode <auto|termux-native|ndk-cross>] [--run-cargo-check] [--diagnose-log <path>] [--json-output <path|-] [--quiet] [--strict]
 
 Options:
   --target <triple>    Android Rust target (default: aarch64-linux-android)
@@ -35,6 +36,7 @@ Options:
   --diagnose-log <p>   Diagnose an existing cargo error log and print targeted recovery commands.
   --json-output <p|-]  Write machine-readable report JSON to path, or '-' for stdout.
   --quiet              Suppress informational logs (warnings/errors still emitted).
+  --strict             Fail with structured error when any warning is detected.
   -h, --help           Show this help
 
 Purpose:
@@ -140,12 +142,15 @@ emit_json_report() {
     printf '  "mode_requested": "%s",\n' "$(json_escape "$MODE")"
     printf '  "mode_effective": "%s",\n' "$(json_escape "${effective_mode:-}")"
     printf '  "environment": "%s",\n' "$env_text"
+    printf '  "strict_mode": %s,\n' "$([[ "$STRICT" -eq 1 ]] && printf 'true' || printf 'false')"
     printf '  "run_cargo_check": %s,\n' "$([[ "$RUN_CARGO_CHECK" -eq 1 ]] && printf 'true' || printf 'false')"
     printf '  "diagnose_log": %s,\n' "$(json_string_or_null "$DIAGNOSE_LOG")"
     printf '  "config_linker": %s,\n' "$(json_string_or_null "$config_linker")"
     printf '  "cargo_linker_override": %s,\n' "$(json_string_or_null "$cargo_linker_override")"
     printf '  "cc_linker_override": %s,\n' "$(json_string_or_null "$cc_linker_override")"
     printf '  "effective_linker": %s,\n' "$(json_string_or_null "$effective_linker")"
+    printf '  "warning_count": %s,\n' "${#WARNINGS[@]}"
+    printf '  "detection_count": %s,\n' "${#DETECTIONS[@]}"
     printf '  "warnings": %s,\n' "$(json_array_from_args "${WARNINGS[@]}")"
     printf '  "detections": %s,\n' "$(json_array_from_args "${DETECTIONS[@]}")"
     printf '  "detection_codes": %s,\n' "$(json_array_from_args "${DETECTION_CODES[@]}")"
@@ -167,6 +172,13 @@ die() {
   printf '[android-selfcheck] error: %s\n' "$*" >&2
   emit_json_report 1
   exit 1
+}
+
+enforce_strict_mode() {
+  if [[ "$STRICT" -eq 1 && "${#WARNINGS[@]}" -gt 0 ]]; then
+    ERROR_CODE="STRICT_WARNINGS"
+    die "strict mode failed: ${#WARNINGS[@]} warning(s) detected"
+  fi
 }
 
 while [[ $# -gt 0 ]]; do
@@ -212,6 +224,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --quiet)
       QUIET=1
+      shift
+      ;;
+    --strict)
+      STRICT=1
       shift
       ;;
     -h|--help)
@@ -468,6 +484,7 @@ if [[ -n "$DIAGNOSE_LOG" ]]; then
   log "diagnosing provided cargo log: $DIAGNOSE_LOG"
   diagnose_cargo_failure "$DIAGNOSE_LOG"
   log "diagnosis completed"
+  enforce_strict_mode
   emit_json_report 0
   exit 0
 fi
@@ -498,4 +515,5 @@ else
 fi
 
 log "self-check completed"
+enforce_strict_mode
 emit_json_report 0

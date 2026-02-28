@@ -103,6 +103,7 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertIn("--diagnose-log <p>", proc.stdout)
         self.assertIn("--json-output <p|-]", proc.stdout)
         self.assertIn("--quiet", proc.stdout)
+        self.assertIn("--strict", proc.stdout)
 
     def test_android_selfcheck_diagnose_log_ndk_cross(self) -> None:
         log_path = self.tmp / "android-failure.log"
@@ -192,6 +193,7 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertEqual(report["schema_version"], "zeroclaw.android-selfcheck.v1")
         self.assertEqual(report["status"], "ok")
         self.assertEqual(report["error_code"], "NONE")
+        self.assertFalse(report["strict_mode"])
         self.assertEqual(report["target"], "aarch64-linux-android")
         self.assertEqual(report["mode_effective"], "ndk-cross")
         self.assertTrue(any("cc-rs compiler lookup failure" in x for x in report["detections"]))
@@ -251,6 +253,66 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         report = json.loads(proc.stdout)
         self.assertEqual(report["status"], "ok")
         self.assertEqual(report["mode_effective"], "ndk-cross")
+
+    def test_android_selfcheck_strict_fails_when_warnings_present(self) -> None:
+        log_path = self.tmp / "android-failure-strict.log"
+        json_path = self.tmp / "android-selfcheck-strict-error.json"
+        log_path.write_text(
+            textwrap.dedent(
+                """
+                error occurred in cc-rs: failed to find tool "aarch64-linux-android-clang": No such file or directory (os error 2)
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        proc = run_cmd(
+            [
+                "bash",
+                self._android_script("termux_source_build_check.sh"),
+                "--target",
+                "aarch64-linux-android",
+                "--mode",
+                "ndk-cross",
+                "--diagnose-log",
+                str(log_path),
+                "--json-output",
+                str(json_path),
+                "--strict",
+            ]
+        )
+        self.assertEqual(proc.returncode, 1)
+        report = json.loads(json_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["status"], "error")
+        self.assertEqual(report["error_code"], "STRICT_WARNINGS")
+        self.assertTrue(report["strict_mode"])
+        self.assertGreater(report["warning_count"], 0)
+
+    def test_android_selfcheck_strict_passes_without_warnings(self) -> None:
+        log_path = self.tmp / "android-clean-strict.log"
+        json_path = self.tmp / "android-selfcheck-strict-ok.json"
+        log_path.write_text("build completed cleanly\n", encoding="utf-8")
+        proc = run_cmd(
+            [
+                "bash",
+                self._android_script("termux_source_build_check.sh"),
+                "--target",
+                "aarch64-linux-android",
+                "--mode",
+                "ndk-cross",
+                "--diagnose-log",
+                str(log_path),
+                "--json-output",
+                str(json_path),
+                "--strict",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(json_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["error_code"], "NONE")
+        self.assertEqual(report["warning_count"], 0)
+        self.assertTrue(report["strict_mode"])
 
     def test_android_selfcheck_bad_argument_reports_error_code(self) -> None:
         json_path = self.tmp / "android-selfcheck-bad-arg.json"
