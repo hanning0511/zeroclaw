@@ -252,6 +252,23 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertEqual(report["status"], "ok")
         self.assertEqual(report["mode_effective"], "ndk-cross")
 
+    def test_android_selfcheck_bad_argument_reports_error_code(self) -> None:
+        json_path = self.tmp / "android-selfcheck-bad-arg.json"
+        proc = run_cmd(
+            [
+                "bash",
+                self._android_script("termux_source_build_check.sh"),
+                "--mode",
+                "invalid-mode",
+                "--json-output",
+                str(json_path),
+            ]
+        )
+        self.assertEqual(proc.returncode, 1)
+        report = json.loads(json_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["status"], "error")
+        self.assertEqual(report["error_code"], "BAD_ARGUMENT")
+
     def test_emit_audit_event_envelope(self) -> None:
         payload_path = self.tmp / "payload.json"
         output_path = self.tmp / "event.json"

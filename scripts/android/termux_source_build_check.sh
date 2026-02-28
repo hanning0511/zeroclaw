@@ -101,6 +101,12 @@ detect_warn() {
 
 add_detection_code() {
   local code="$1"
+  local existing
+  for existing in "${DETECTION_CODES[@]}"; do
+    if [[ "$existing" == "$code" ]]; then
+      return 0
+    fi
+  done
   DETECTION_CODES+=("$code")
 }
 
@@ -258,6 +264,10 @@ if [[ "$effective_mode" == "auto" ]]; then
     effective_mode="ndk-cross"
   fi
 fi
+OFFLINE_DIAGNOSE=0
+if [[ -n "$DIAGNOSE_LOG" ]]; then
+  OFFLINE_DIAGNOSE=1
+fi
 
 extract_linker_from_config() {
   [[ -f "$CONFIG_FILE" ]] || return 0
@@ -390,61 +400,63 @@ fi
 effective_linker="${cargo_linker_override:-${config_linker:-clang}}"
 log "effective linker: $effective_linker"
 
-if [[ "$effective_mode" == "termux-native" ]]; then
-  if ! command_exists clang; then
-    if [[ "$is_termux" -eq 1 ]]; then
-      ERROR_CODE="TERMUX_CLANG_MISSING"
-      die "clang is required in Termux. Run: pkg install -y clang pkg-config"
-    fi
-    warn "clang is not available on this non-Termux host; termux-native checks are partial"
-  fi
-
-  if [[ "${config_linker:-}" != "clang" ]]; then
-    warn "Termux native build should use linker = \"clang\" for $TARGET"
-  fi
-
-  if [[ -n "$cargo_linker_override" && "$cargo_linker_override" != "clang" ]]; then
-    warn "Termux native build usually should unset $CARGO_LINKER_VAR (currently '$cargo_linker_override')"
-  fi
-  if [[ -n "$cc_linker_override" && "$cc_linker_override" != "clang" ]]; then
-    warn "Termux native build usually should unset $CC_LINKER_VAR (currently '$cc_linker_override')"
-  fi
-
-  suggest "suggested fixups (termux-native):"
-  suggest "  unset $CARGO_LINKER_VAR"
-  suggest "  unset $CC_LINKER_VAR"
-  suggest "  command -v clang"
-else
-  if [[ -n "$cargo_linker_override" && -z "$cc_linker_override" ]]; then
-    warn "cross-build may still fail in cc-rs crates; consider setting $CC_LINKER_VAR=$cargo_linker_override"
-  fi
-
-  if [[ -n "$cargo_linker_override" ]]; then
-    suggest "suggested fixup (ndk-cross):"
-    suggest "  export $CC_LINKER_VAR=\"$cargo_linker_override\""
-  else
-    warn "NDK cross mode expects $CARGO_LINKER_VAR to point to an NDK clang wrapper"
-    suggest "suggested fixup template (ndk-cross):"
-    suggest "  export NDK_TOOLCHAIN=\"\$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin\""
-    if [[ "$TARGET" == "aarch64-linux-android" ]]; then
-      suggest "  export $CARGO_LINKER_VAR=\"\$NDK_TOOLCHAIN/aarch64-linux-android21-clang\""
-      suggest "  export $CC_LINKER_VAR=\"\$NDK_TOOLCHAIN/aarch64-linux-android21-clang\""
-    else
-      suggest "  export $CARGO_LINKER_VAR=\"\$NDK_TOOLCHAIN/armv7a-linux-androideabi21-clang\""
-      suggest "  export $CC_LINKER_VAR=\"\$NDK_TOOLCHAIN/armv7a-linux-androideabi21-clang\""
-    fi
-  fi
-fi
-
-if ! is_executable_tool "$effective_linker"; then
+if [[ "$OFFLINE_DIAGNOSE" -eq 0 ]]; then
   if [[ "$effective_mode" == "termux-native" ]]; then
-    if [[ "$is_termux" -eq 1 ]]; then
-      ERROR_CODE="LINKER_NOT_EXECUTABLE"
-      die "effective linker '$effective_linker' is not executable in PATH"
+    if ! command_exists clang; then
+      if [[ "$is_termux" -eq 1 ]]; then
+        ERROR_CODE="TERMUX_CLANG_MISSING"
+        die "clang is required in Termux. Run: pkg install -y clang pkg-config"
+      fi
+      warn "clang is not available on this non-Termux host; termux-native checks are partial"
     fi
-    warn "effective linker '$effective_linker' not executable on this non-Termux host"
+
+    if [[ "${config_linker:-}" != "clang" ]]; then
+      warn "Termux native build should use linker = \"clang\" for $TARGET"
+    fi
+
+    if [[ -n "$cargo_linker_override" && "$cargo_linker_override" != "clang" ]]; then
+      warn "Termux native build usually should unset $CARGO_LINKER_VAR (currently '$cargo_linker_override')"
+    fi
+    if [[ -n "$cc_linker_override" && "$cc_linker_override" != "clang" ]]; then
+      warn "Termux native build usually should unset $CC_LINKER_VAR (currently '$cc_linker_override')"
+    fi
+
+    suggest "suggested fixups (termux-native):"
+    suggest "  unset $CARGO_LINKER_VAR"
+    suggest "  unset $CC_LINKER_VAR"
+    suggest "  command -v clang"
   else
-    warn "effective linker '$effective_linker' not found (expected for some desktop hosts without NDK toolchain)"
+    if [[ -n "$cargo_linker_override" && -z "$cc_linker_override" ]]; then
+      warn "cross-build may still fail in cc-rs crates; consider setting $CC_LINKER_VAR=$cargo_linker_override"
+    fi
+
+    if [[ -n "$cargo_linker_override" ]]; then
+      suggest "suggested fixup (ndk-cross):"
+      suggest "  export $CC_LINKER_VAR=\"$cargo_linker_override\""
+    else
+      warn "NDK cross mode expects $CARGO_LINKER_VAR to point to an NDK clang wrapper"
+      suggest "suggested fixup template (ndk-cross):"
+      suggest "  export NDK_TOOLCHAIN=\"\$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin\""
+      if [[ "$TARGET" == "aarch64-linux-android" ]]; then
+        suggest "  export $CARGO_LINKER_VAR=\"\$NDK_TOOLCHAIN/aarch64-linux-android21-clang\""
+        suggest "  export $CC_LINKER_VAR=\"\$NDK_TOOLCHAIN/aarch64-linux-android21-clang\""
+      else
+        suggest "  export $CARGO_LINKER_VAR=\"\$NDK_TOOLCHAIN/armv7a-linux-androideabi21-clang\""
+        suggest "  export $CC_LINKER_VAR=\"\$NDK_TOOLCHAIN/armv7a-linux-androideabi21-clang\""
+      fi
+    fi
+  fi
+
+  if ! is_executable_tool "$effective_linker"; then
+    if [[ "$effective_mode" == "termux-native" ]]; then
+      if [[ "$is_termux" -eq 1 ]]; then
+        ERROR_CODE="LINKER_NOT_EXECUTABLE"
+        die "effective linker '$effective_linker' is not executable in PATH"
+      fi
+      warn "effective linker '$effective_linker' not executable on this non-Termux host"
+    else
+      warn "effective linker '$effective_linker' not found (expected for some desktop hosts without NDK toolchain)"
+    fi
   fi
 fi
 
