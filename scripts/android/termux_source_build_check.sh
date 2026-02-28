@@ -5,11 +5,21 @@ TARGET="aarch64-linux-android"
 RUN_CARGO_CHECK=0
 MODE="auto"
 DIAGNOSE_LOG=""
+JSON_OUTPUT=""
+ERROR_MESSAGE=""
+config_linker=""
+cargo_linker_override=""
+cc_linker_override=""
+effective_linker=""
+
+WARNINGS=()
+SUGGESTIONS=()
+DETECTIONS=()
 
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/android/termux_source_build_check.sh [--target <triple>] [--mode <auto|termux-native|ndk-cross>] [--run-cargo-check] [--diagnose-log <path>]
+  scripts/android/termux_source_build_check.sh [--target <triple>] [--mode <auto|termux-native|ndk-cross>] [--run-cargo-check] [--diagnose-log <path>] [--json-output <path>]
 
 Options:
   --target <triple>    Android Rust target (default: aarch64-linux-android)
@@ -20,6 +30,7 @@ Options:
                        ndk-cross: expect NDK wrapper linker + matching CC_*
   --run-cargo-check    Run cargo check --locked --target <triple> --no-default-features
   --diagnose-log <p>   Diagnose an existing cargo error log and print targeted recovery commands.
+  --json-output <p>    Write machine-readable report JSON to the given path.
   -h, --help           Show this help
 
 Purpose:
@@ -36,10 +47,98 @@ log() {
 
 warn() {
   printf '[android-selfcheck] warning: %s\n' "$*" >&2
+  WARNINGS+=("$*")
+}
+
+json_escape() {
+  local s="$1"
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  printf '%s' "$s"
+}
+
+json_array_from_args() {
+  local first=1
+  local item
+  printf '['
+  for item in "$@"; do
+    if [[ "$first" -eq 0 ]]; then
+      printf ', '
+    fi
+    printf '"%s"' "$(json_escape "$item")"
+    first=0
+  done
+  printf ']'
+}
+
+json_string_or_null() {
+  local s="${1:-}"
+  if [[ -z "$s" ]]; then
+    printf 'null'
+  else
+    printf '"%s"' "$(json_escape "$s")"
+  fi
+}
+
+suggest() {
+  log "$*"
+  SUGGESTIONS+=("$*")
+}
+
+detect_warn() {
+  warn "$*"
+  DETECTIONS+=("$*")
+}
+
+emit_json_report() {
+  local exit_code="$1"
+  [[ -n "$JSON_OUTPUT" ]] || return 0
+
+  local status_text="ok"
+  if [[ "$exit_code" -ne 0 ]]; then
+    status_text="error"
+  fi
+
+  local env_text="non-termux"
+  if [[ "${is_termux:-0}" -eq 1 ]]; then
+    env_text="termux"
+  fi
+
+  local ts
+  ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || printf '%s' "unknown")"
+
+  mkdir -p "$(dirname "$JSON_OUTPUT")"
+  {
+    printf '{\n'
+    printf '  "schema_version": "zeroclaw.android-selfcheck.v1",\n'
+    printf '  "timestamp_utc": "%s",\n' "$(json_escape "$ts")"
+    printf '  "status": "%s",\n' "$status_text"
+    printf '  "exit_code": %s,\n' "$exit_code"
+    printf '  "error_message": %s,\n' "$(json_string_or_null "$ERROR_MESSAGE")"
+    printf '  "target": "%s",\n' "$(json_escape "$TARGET")"
+    printf '  "mode_requested": "%s",\n' "$(json_escape "$MODE")"
+    printf '  "mode_effective": "%s",\n' "$(json_escape "${effective_mode:-}")"
+    printf '  "environment": "%s",\n' "$env_text"
+    printf '  "run_cargo_check": %s,\n' "$([[ "$RUN_CARGO_CHECK" -eq 1 ]] && printf 'true' || printf 'false')"
+    printf '  "diagnose_log": %s,\n' "$(json_string_or_null "$DIAGNOSE_LOG")"
+    printf '  "config_linker": %s,\n' "$(json_string_or_null "$config_linker")"
+    printf '  "cargo_linker_override": %s,\n' "$(json_string_or_null "$cargo_linker_override")"
+    printf '  "cc_linker_override": %s,\n' "$(json_string_or_null "$cc_linker_override")"
+    printf '  "effective_linker": %s,\n' "$(json_string_or_null "$effective_linker")"
+    printf '  "warnings": %s,\n' "$(json_array_from_args "${WARNINGS[@]}")"
+    printf '  "detections": %s,\n' "$(json_array_from_args "${DETECTIONS[@]}")"
+    printf '  "suggestions": %s\n' "$(json_array_from_args "${SUGGESTIONS[@]}")"
+    printf '}\n'
+  } >"$JSON_OUTPUT"
 }
 
 die() {
+  ERROR_MESSAGE="$*"
   printf '[android-selfcheck] error: %s\n' "$*" >&2
+  emit_json_report 1
   exit 1
 }
 
@@ -62,6 +161,11 @@ while [[ $# -gt 0 ]]; do
     --diagnose-log)
       [[ $# -ge 2 ]] || die "--diagnose-log requires a path"
       DIAGNOSE_LOG="$2"
+      shift 2
+      ;;
+    --json-output)
+      [[ $# -ge 2 ]] || die "--json-output requires a path"
+      JSON_OUTPUT="$2"
       shift 2
       ;;
     -h|--help)
@@ -154,43 +258,43 @@ diagnose_cargo_failure() {
   log "cargo check failed; analyzing common Android toolchain issues..."
 
   if grep -Eq 'failed to find tool "aarch64-linux-android-clang"|failed to find tool "armv7a-linux-androideabi-clang"|ToolNotFound' "$log_file"; then
-    warn "detected cc-rs compiler lookup failure for Android target"
+    detect_warn "detected cc-rs compiler lookup failure for Android target"
     if [[ "$effective_mode" == "termux-native" ]]; then
-      log "suggested recovery (termux-native):"
-      log "  unset $CARGO_LINKER_VAR"
-      log "  unset $CC_LINKER_VAR"
-      log "  pkg install -y clang pkg-config"
-      log "  command -v clang"
+      suggest "suggested recovery (termux-native):"
+      suggest "  unset $CARGO_LINKER_VAR"
+      suggest "  unset $CC_LINKER_VAR"
+      suggest "  pkg install -y clang pkg-config"
+      suggest "  command -v clang"
     else
-      log "suggested recovery (ndk-cross):"
-      log "  export NDK_TOOLCHAIN=\"\$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin\""
-      log "  export $CARGO_LINKER_VAR=\"\$NDK_TOOLCHAIN/$ndk_wrapper\""
-      log "  export $CC_LINKER_VAR=\"\$NDK_TOOLCHAIN/$ndk_wrapper\""
-      log "  command -v \"\$NDK_TOOLCHAIN/$ndk_wrapper\""
+      suggest "suggested recovery (ndk-cross):"
+      suggest "  export NDK_TOOLCHAIN=\"\$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin\""
+      suggest "  export $CARGO_LINKER_VAR=\"\$NDK_TOOLCHAIN/$ndk_wrapper\""
+      suggest "  export $CC_LINKER_VAR=\"\$NDK_TOOLCHAIN/$ndk_wrapper\""
+      suggest "  command -v \"\$NDK_TOOLCHAIN/$ndk_wrapper\""
     fi
   fi
 
   if grep -Eq 'linker `clang` not found|linker .* not found|cannot find linker|failed to find tool "clang"' "$log_file"; then
-    warn "detected linker resolution failure"
+    detect_warn "detected linker resolution failure"
     if [[ "$effective_mode" == "termux-native" ]]; then
-      log "suggested recovery (termux-native):"
-      log "  pkg install -y clang pkg-config"
-      log "  command -v clang"
+      suggest "suggested recovery (termux-native):"
+      suggest "  pkg install -y clang pkg-config"
+      suggest "  command -v clang"
     else
-      log "suggested recovery (ndk-cross):"
-      log "  export $CARGO_LINKER_VAR=\"\$NDK_TOOLCHAIN/$ndk_wrapper\""
-      log "  export $CC_LINKER_VAR=\"\$NDK_TOOLCHAIN/$ndk_wrapper\""
+      suggest "suggested recovery (ndk-cross):"
+      suggest "  export $CARGO_LINKER_VAR=\"\$NDK_TOOLCHAIN/$ndk_wrapper\""
+      suggest "  export $CC_LINKER_VAR=\"\$NDK_TOOLCHAIN/$ndk_wrapper\""
     fi
   fi
 
   if grep -Eq "target '$TARGET' not found|can't find crate for std|did you mean to run rustup target add" "$log_file"; then
-    warn "detected missing Rust target stdlib"
-    log "suggested recovery:"
-    log "  rustup target add $TARGET"
+    detect_warn "detected missing Rust target stdlib"
+    suggest "suggested recovery:"
+    suggest "  rustup target add $TARGET"
   fi
 
   if grep -Eq 'No such file or directory \(os error 2\)' "$log_file"; then
-    warn "detected missing binary/file in build chain; verify linker and CC_* variables point to real executables"
+    detect_warn "detected missing binary/file in build chain; verify linker and CC_* variables point to real executables"
   fi
 }
 
@@ -251,28 +355,28 @@ if [[ "$effective_mode" == "termux-native" ]]; then
     warn "Termux native build usually should unset $CC_LINKER_VAR (currently '$cc_linker_override')"
   fi
 
-  log "suggested fixups (termux-native):"
-  log "  unset $CARGO_LINKER_VAR"
-  log "  unset $CC_LINKER_VAR"
-  log "  command -v clang"
+  suggest "suggested fixups (termux-native):"
+  suggest "  unset $CARGO_LINKER_VAR"
+  suggest "  unset $CC_LINKER_VAR"
+  suggest "  command -v clang"
 else
   if [[ -n "$cargo_linker_override" && -z "$cc_linker_override" ]]; then
     warn "cross-build may still fail in cc-rs crates; consider setting $CC_LINKER_VAR=$cargo_linker_override"
   fi
 
   if [[ -n "$cargo_linker_override" ]]; then
-    log "suggested fixup (ndk-cross):"
-    log "  export $CC_LINKER_VAR=\"$cargo_linker_override\""
+    suggest "suggested fixup (ndk-cross):"
+    suggest "  export $CC_LINKER_VAR=\"$cargo_linker_override\""
   else
     warn "NDK cross mode expects $CARGO_LINKER_VAR to point to an NDK clang wrapper"
-    log "suggested fixup template (ndk-cross):"
-    log "  export NDK_TOOLCHAIN=\"\$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin\""
+    suggest "suggested fixup template (ndk-cross):"
+    suggest "  export NDK_TOOLCHAIN=\"\$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin\""
     if [[ "$TARGET" == "aarch64-linux-android" ]]; then
-      log "  export $CARGO_LINKER_VAR=\"\$NDK_TOOLCHAIN/aarch64-linux-android21-clang\""
-      log "  export $CC_LINKER_VAR=\"\$NDK_TOOLCHAIN/aarch64-linux-android21-clang\""
+      suggest "  export $CARGO_LINKER_VAR=\"\$NDK_TOOLCHAIN/aarch64-linux-android21-clang\""
+      suggest "  export $CC_LINKER_VAR=\"\$NDK_TOOLCHAIN/aarch64-linux-android21-clang\""
     else
-      log "  export $CARGO_LINKER_VAR=\"\$NDK_TOOLCHAIN/armv7a-linux-androideabi21-clang\""
-      log "  export $CC_LINKER_VAR=\"\$NDK_TOOLCHAIN/armv7a-linux-androideabi21-clang\""
+      suggest "  export $CARGO_LINKER_VAR=\"\$NDK_TOOLCHAIN/armv7a-linux-androideabi21-clang\""
+      suggest "  export $CC_LINKER_VAR=\"\$NDK_TOOLCHAIN/armv7a-linux-androideabi21-clang\""
     fi
   fi
 fi
@@ -293,6 +397,7 @@ if [[ -n "$DIAGNOSE_LOG" ]]; then
   log "diagnosing provided cargo log: $DIAGNOSE_LOG"
   diagnose_cargo_failure "$DIAGNOSE_LOG"
   log "diagnosis completed"
+  emit_json_report 0
   exit 0
 fi
 
@@ -321,3 +426,4 @@ else
 fi
 
 log "self-check completed"
+emit_json_report 0
