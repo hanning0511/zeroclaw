@@ -6,7 +6,9 @@ RUN_CARGO_CHECK=0
 MODE="auto"
 DIAGNOSE_LOG=""
 JSON_OUTPUT=""
+QUIET=0
 ERROR_MESSAGE=""
+ERROR_CODE="NONE"
 config_linker=""
 cargo_linker_override=""
 cc_linker_override=""
@@ -15,11 +17,12 @@ effective_linker=""
 WARNINGS=()
 SUGGESTIONS=()
 DETECTIONS=()
+DETECTION_CODES=()
 
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/android/termux_source_build_check.sh [--target <triple>] [--mode <auto|termux-native|ndk-cross>] [--run-cargo-check] [--diagnose-log <path>] [--json-output <path>]
+  scripts/android/termux_source_build_check.sh [--target <triple>] [--mode <auto|termux-native|ndk-cross>] [--run-cargo-check] [--diagnose-log <path>] [--json-output <path|-] [--quiet]
 
 Options:
   --target <triple>    Android Rust target (default: aarch64-linux-android)
@@ -30,7 +33,8 @@ Options:
                        ndk-cross: expect NDK wrapper linker + matching CC_*
   --run-cargo-check    Run cargo check --locked --target <triple> --no-default-features
   --diagnose-log <p>   Diagnose an existing cargo error log and print targeted recovery commands.
-  --json-output <p>    Write machine-readable report JSON to the given path.
+  --json-output <p|-]  Write machine-readable report JSON to path, or '-' for stdout.
+  --quiet              Suppress informational logs (warnings/errors still emitted).
   -h, --help           Show this help
 
 Purpose:
@@ -42,7 +46,9 @@ EOF
 }
 
 log() {
-  printf '[android-selfcheck] %s\n' "$*"
+  if [[ "$QUIET" -eq 0 ]]; then
+    printf '[android-selfcheck] %s\n' "$*"
+  fi
 }
 
 warn() {
@@ -93,6 +99,11 @@ detect_warn() {
   DETECTIONS+=("$*")
 }
 
+add_detection_code() {
+  local code="$1"
+  DETECTION_CODES+=("$code")
+}
+
 emit_json_report() {
   local exit_code="$1"
   [[ -n "$JSON_OUTPUT" ]] || return 0
@@ -110,13 +121,14 @@ emit_json_report() {
   local ts
   ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || printf '%s' "unknown")"
 
-  mkdir -p "$(dirname "$JSON_OUTPUT")"
-  {
+  local json_payload
+  json_payload="$(
     printf '{\n'
     printf '  "schema_version": "zeroclaw.android-selfcheck.v1",\n'
     printf '  "timestamp_utc": "%s",\n' "$(json_escape "$ts")"
     printf '  "status": "%s",\n' "$status_text"
     printf '  "exit_code": %s,\n' "$exit_code"
+    printf '  "error_code": "%s",\n' "$(json_escape "$ERROR_CODE")"
     printf '  "error_message": %s,\n' "$(json_string_or_null "$ERROR_MESSAGE")"
     printf '  "target": "%s",\n' "$(json_escape "$TARGET")"
     printf '  "mode_requested": "%s",\n' "$(json_escape "$MODE")"
@@ -130,9 +142,18 @@ emit_json_report() {
     printf '  "effective_linker": %s,\n' "$(json_string_or_null "$effective_linker")"
     printf '  "warnings": %s,\n' "$(json_array_from_args "${WARNINGS[@]}")"
     printf '  "detections": %s,\n' "$(json_array_from_args "${DETECTIONS[@]}")"
+    printf '  "detection_codes": %s,\n' "$(json_array_from_args "${DETECTION_CODES[@]}")"
     printf '  "suggestions": %s\n' "$(json_array_from_args "${SUGGESTIONS[@]}")"
     printf '}\n'
-  } >"$JSON_OUTPUT"
+  )"
+
+  if [[ "$JSON_OUTPUT" == "-" ]]; then
+    printf '%s' "$json_payload"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$JSON_OUTPUT")"
+  printf '%s' "$json_payload" >"$JSON_OUTPUT"
 }
 
 die() {
@@ -145,7 +166,10 @@ die() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --target)
-      [[ $# -ge 2 ]] || die "--target requires a value"
+      if [[ $# -lt 2 ]]; then
+        ERROR_CODE="BAD_ARGUMENT"
+        die "--target requires a value"
+      fi
       TARGET="$2"
       shift 2
       ;;
@@ -154,25 +178,42 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --mode)
-      [[ $# -ge 2 ]] || die "--mode requires a value"
+      if [[ $# -lt 2 ]]; then
+        ERROR_CODE="BAD_ARGUMENT"
+        die "--mode requires a value"
+      fi
       MODE="$2"
       shift 2
       ;;
     --diagnose-log)
-      [[ $# -ge 2 ]] || die "--diagnose-log requires a path"
+      if [[ $# -lt 2 ]]; then
+        ERROR_CODE="BAD_ARGUMENT"
+        die "--diagnose-log requires a path"
+      fi
       DIAGNOSE_LOG="$2"
       shift 2
       ;;
     --json-output)
-      [[ $# -ge 2 ]] || die "--json-output requires a path"
+      if [[ $# -lt 2 ]]; then
+        ERROR_CODE="BAD_ARGUMENT"
+        die "--json-output requires a path"
+      fi
       JSON_OUTPUT="$2"
+      if [[ "$JSON_OUTPUT" == "-" ]]; then
+        QUIET=1
+      fi
       shift 2
+      ;;
+    --quiet)
+      QUIET=1
+      shift
       ;;
     -h|--help)
       usage
       exit 0
       ;;
     *)
+      ERROR_CODE="BAD_ARGUMENT"
       die "unknown argument: $1 (use --help)"
       ;;
   esac
@@ -181,6 +222,7 @@ done
 case "$TARGET" in
   aarch64-linux-android|armv7-linux-androideabi) ;;
   *)
+    ERROR_CODE="BAD_ARGUMENT"
     die "unsupported target '$TARGET' (expected aarch64-linux-android or armv7-linux-androideabi)"
     ;;
 esac
@@ -188,6 +230,7 @@ esac
 case "$MODE" in
   auto|termux-native|ndk-cross) ;;
   *)
+    ERROR_CODE="BAD_ARGUMENT"
     die "unsupported mode '$MODE' (expected auto, termux-native, or ndk-cross)"
     ;;
 esac
@@ -259,6 +302,7 @@ diagnose_cargo_failure() {
 
   if grep -Eq 'failed to find tool "aarch64-linux-android-clang"|failed to find tool "armv7a-linux-androideabi-clang"|ToolNotFound' "$log_file"; then
     detect_warn "detected cc-rs compiler lookup failure for Android target"
+    add_detection_code "CC_RS_TOOL_NOT_FOUND"
     if [[ "$effective_mode" == "termux-native" ]]; then
       suggest "suggested recovery (termux-native):"
       suggest "  unset $CARGO_LINKER_VAR"
@@ -276,6 +320,7 @@ diagnose_cargo_failure() {
 
   if grep -Eq 'linker `clang` not found|linker .* not found|cannot find linker|failed to find tool "clang"' "$log_file"; then
     detect_warn "detected linker resolution failure"
+    add_detection_code "LINKER_RESOLUTION_FAILURE"
     if [[ "$effective_mode" == "termux-native" ]]; then
       suggest "suggested recovery (termux-native):"
       suggest "  pkg install -y clang pkg-config"
@@ -289,12 +334,14 @@ diagnose_cargo_failure() {
 
   if grep -Eq "target '$TARGET' not found|can't find crate for std|did you mean to run rustup target add" "$log_file"; then
     detect_warn "detected missing Rust target stdlib"
+    add_detection_code "MISSING_RUST_TARGET_STDLIB"
     suggest "suggested recovery:"
     suggest "  rustup target add $TARGET"
   fi
 
   if grep -Eq 'No such file or directory \(os error 2\)' "$log_file"; then
     detect_warn "detected missing binary/file in build chain; verify linker and CC_* variables point to real executables"
+    add_detection_code "MISSING_BINARY_OR_FILE"
   fi
 }
 
@@ -308,10 +355,17 @@ fi
 log "mode: $effective_mode"
 
 if [[ -z "$DIAGNOSE_LOG" ]]; then
-  command_exists rustup || die "rustup is not installed"
-  command_exists cargo || die "cargo is not installed"
+  if ! command_exists rustup; then
+    ERROR_CODE="MISSING_RUSTUP"
+    die "rustup is not installed"
+  fi
+  if ! command_exists cargo; then
+    ERROR_CODE="MISSING_CARGO"
+    die "cargo is not installed"
+  fi
 
   if ! rustup target list --installed | grep -Fx "$TARGET" >/dev/null 2>&1; then
+    ERROR_CODE="MISSING_RUST_TARGET"
     die "Rust target '$TARGET' is not installed. Run: rustup target add $TARGET"
   fi
 fi
@@ -339,6 +393,7 @@ log "effective linker: $effective_linker"
 if [[ "$effective_mode" == "termux-native" ]]; then
   if ! command_exists clang; then
     if [[ "$is_termux" -eq 1 ]]; then
+      ERROR_CODE="TERMUX_CLANG_MISSING"
       die "clang is required in Termux. Run: pkg install -y clang pkg-config"
     fi
     warn "clang is not available on this non-Termux host; termux-native checks are partial"
@@ -384,6 +439,7 @@ fi
 if ! is_executable_tool "$effective_linker"; then
   if [[ "$effective_mode" == "termux-native" ]]; then
     if [[ "$is_termux" -eq 1 ]]; then
+      ERROR_CODE="LINKER_NOT_EXECUTABLE"
       die "effective linker '$effective_linker' is not executable in PATH"
     fi
     warn "effective linker '$effective_linker' not executable on this non-Termux host"
@@ -393,7 +449,10 @@ if ! is_executable_tool "$effective_linker"; then
 fi
 
 if [[ -n "$DIAGNOSE_LOG" ]]; then
-  [[ -f "$DIAGNOSE_LOG" ]] || die "diagnose log file does not exist: $DIAGNOSE_LOG"
+  if [[ ! -f "$DIAGNOSE_LOG" ]]; then
+    ERROR_CODE="MISSING_DIAGNOSE_LOG"
+    die "diagnose log file does not exist: $DIAGNOSE_LOG"
+  fi
   log "diagnosing provided cargo log: $DIAGNOSE_LOG"
   diagnose_cargo_failure "$DIAGNOSE_LOG"
   log "diagnosis completed"
@@ -417,6 +476,7 @@ if [[ "$RUN_CARGO_CHECK" -eq 1 ]]; then
 
   if [[ "$cargo_status" -ne 0 ]]; then
     diagnose_cargo_failure "$tmp_log"
+    ERROR_CODE="CARGO_CHECK_FAILED"
     die "cargo check failed (exit $cargo_status)"
   fi
 

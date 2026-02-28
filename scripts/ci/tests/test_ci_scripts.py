@@ -101,6 +101,8 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, msg=proc.stderr)
         self.assertIn("--mode <auto|termux-native|ndk-cross>", proc.stdout)
         self.assertIn("--diagnose-log <p>", proc.stdout)
+        self.assertIn("--json-output <p|-]", proc.stdout)
+        self.assertIn("--quiet", proc.stdout)
 
     def test_android_selfcheck_diagnose_log_ndk_cross(self) -> None:
         log_path = self.tmp / "android-failure.log"
@@ -189,9 +191,11 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         report = json.loads(json_path.read_text(encoding="utf-8"))
         self.assertEqual(report["schema_version"], "zeroclaw.android-selfcheck.v1")
         self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["error_code"], "NONE")
         self.assertEqual(report["target"], "aarch64-linux-android")
         self.assertEqual(report["mode_effective"], "ndk-cross")
         self.assertTrue(any("cc-rs compiler lookup failure" in x for x in report["detections"]))
+        self.assertIn("CC_RS_TOOL_NOT_FOUND", report["detection_codes"])
         self.assertTrue(any("CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER" in x for x in report["suggestions"]))
 
     def test_android_selfcheck_json_output_on_missing_diagnose_log(self) -> None:
@@ -215,7 +219,38 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         report = json.loads(json_path.read_text(encoding="utf-8"))
         self.assertEqual(report["status"], "error")
         self.assertEqual(report["exit_code"], 1)
+        self.assertEqual(report["error_code"], "MISSING_DIAGNOSE_LOG")
         self.assertIn("does not exist", report["error_message"])
+
+    def test_android_selfcheck_json_stdout_mode(self) -> None:
+        log_path = self.tmp / "android-failure-stdout.log"
+        log_path.write_text(
+            textwrap.dedent(
+                """
+                error occurred in cc-rs: failed to find tool "aarch64-linux-android-clang": No such file or directory (os error 2)
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        proc = run_cmd(
+            [
+                "bash",
+                self._android_script("termux_source_build_check.sh"),
+                "--target",
+                "aarch64-linux-android",
+                "--mode",
+                "ndk-cross",
+                "--diagnose-log",
+                str(log_path),
+                "--json-output",
+                "-",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        report = json.loads(proc.stdout)
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["mode_effective"], "ndk-cross")
 
     def test_emit_audit_event_envelope(self) -> None:
         payload_path = self.tmp / "payload.json"
