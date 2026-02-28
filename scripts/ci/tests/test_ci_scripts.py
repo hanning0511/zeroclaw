@@ -3053,7 +3053,6 @@ class CiScriptsBehaviorTest(unittest.TestCase):
                             "Nightly Summary & Routing",
                         ],
                         "stable": [
-                            "Main Promotion Gate",
                             "CI Required Gate",
                             "Security Audit",
                             "Feature Matrix Summary",
@@ -3151,7 +3150,6 @@ class CiScriptsBehaviorTest(unittest.TestCase):
                             "Nightly Summary & Routing",
                         ],
                         "stable": [
-                            "Main Promotion Gate",
                             "CI Required Gate",
                             "Security Audit",
                             "Feature Matrix Summary",
@@ -3246,7 +3244,6 @@ class CiScriptsBehaviorTest(unittest.TestCase):
                             "Nightly Summary & Routing",
                         ],
                         "stable": [
-                            "Main Promotion Gate",
                             "CI Required Gate",
                             "Security Audit",
                             "Feature Matrix Summary",
