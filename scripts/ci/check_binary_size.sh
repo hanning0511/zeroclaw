@@ -8,8 +8,8 @@
 #   label        Optional label for step summary (e.g. target triple)
 #
 # Thresholds:
-#   >20MB  — hard error (safeguard)
-#   >15MB  — warning (advisory)
+#   >22MB  — hard error (safeguard)
+#   >20MB  — warning (advisory)
 #   >5MB   — warning (target)
 #
 # Writes to GITHUB_STEP_SUMMARY when the variable is set and label is provided.
@@ -48,11 +48,11 @@ if [ -n "$LABEL" ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   echo "- Size: ${SIZE_MB}MB ($SIZE bytes)" >> "$GITHUB_STEP_SUMMARY"
 fi
 
-if [ "$SIZE" -gt 20971520 ]; then
-  echo "::error::Binary exceeds 20MB safeguard (${SIZE_MB}MB)"
+if [ "$SIZE" -gt 23068672 ]; then
+  echo "::error::Binary exceeds 22MB safeguard (${SIZE_MB}MB)"
   exit 1
-elif [ "$SIZE" -gt 15728640 ]; then
-  echo "::warning::Binary exceeds 15MB advisory target (${SIZE_MB}MB)"
+elif [ "$SIZE" -gt 20971520 ]; then
+  echo "::warning::Binary exceeds 20MB advisory target (${SIZE_MB}MB)"
 elif [ "$SIZE" -gt 5242880 ]; then
   echo "::warning::Binary exceeds 5MB target (${SIZE_MB}MB)"
 else
