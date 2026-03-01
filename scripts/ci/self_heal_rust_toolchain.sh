@@ -11,12 +11,12 @@ if ! command -v rustup >/dev/null 2>&1; then
   exit 0
 fi
 
-if rustc "+${TOOLCHAIN}" --version >/dev/null 2>&1; then
-  echo "Rust toolchain ${TOOLCHAIN} is healthy."
+if rustc "+${TOOLCHAIN}" --version >/dev/null 2>&1 && cargo "+${TOOLCHAIN}" --version >/dev/null 2>&1; then
+  echo "Rust toolchain ${TOOLCHAIN} is healthy (rustc + cargo present)."
   exit 0
 fi
 
-echo "Rust toolchain ${TOOLCHAIN} appears unhealthy; removing cached installs."
+echo "Rust toolchain ${TOOLCHAIN} appears unhealthy (missing rustc/cargo); removing cached installs."
 for candidate in \
   "${TOOLCHAIN}" \
   "${TOOLCHAIN}-x86_64-apple-darwin" \
@@ -26,4 +26,3 @@ for candidate in \
 do
   rustup toolchain uninstall "${candidate}" >/dev/null 2>&1 || true
 done
-
