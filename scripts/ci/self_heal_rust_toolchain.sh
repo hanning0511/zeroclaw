@@ -6,6 +6,24 @@ set -euo pipefail
 
 TOOLCHAIN="${1:-1.92.0}"
 
+# Use per-job Rust homes on self-hosted runners to avoid cross-runner corruption/races.
+if [ -n "${RUNNER_TEMP:-}" ]; then
+  CARGO_HOME="${RUNNER_TEMP%/}/cargo-home"
+  RUSTUP_HOME="${RUNNER_TEMP%/}/rustup-home"
+  mkdir -p "${CARGO_HOME}" "${RUSTUP_HOME}"
+  export CARGO_HOME RUSTUP_HOME
+  export PATH="${CARGO_HOME}/bin:${PATH}"
+  if [ -n "${GITHUB_ENV:-}" ]; then
+    {
+      echo "CARGO_HOME=${CARGO_HOME}"
+      echo "RUSTUP_HOME=${RUSTUP_HOME}"
+    } >> "${GITHUB_ENV}"
+  fi
+  if [ -n "${GITHUB_PATH:-}" ]; then
+    echo "${CARGO_HOME}/bin" >> "${GITHUB_PATH}"
+  fi
+fi
+
 if ! command -v rustup >/dev/null 2>&1; then
   echo "rustup not installed yet; skipping rust toolchain self-heal."
   exit 0
