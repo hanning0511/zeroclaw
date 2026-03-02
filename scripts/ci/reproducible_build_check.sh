@@ -6,7 +6,7 @@ set -euo pipefail
 # - Compare artifact SHA256
 # - Emit JSON + markdown artifacts for auditability
 
-PROFILE="${PROFILE:-release-fast}"
+PROFILE="${PROFILE:-release}"
 BINARY_NAME="${BINARY_NAME:-zeroclaw}"
 OUTPUT_DIR="${OUTPUT_DIR:-artifacts}"
 FAIL_ON_DRIFT="${FAIL_ON_DRIFT:-false}"
