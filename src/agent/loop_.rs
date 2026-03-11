@@ -511,20 +511,64 @@ impl ProgressTracker {
 
     fn render_delta(&self) -> String {
         let mut out = String::from(DRAFT_PROGRESS_BLOCK_SENTINEL);
+
+        // ── Summary line ──────────────────────────────────────
+        let total = self.entries.len();
+        let done = self
+            .entries
+            .iter()
+            .filter(|e| e.completion.is_some())
+            .count();
+        let ok = self
+            .entries
+            .iter()
+            .filter(|e| matches!(e.completion, Some((true, _))))
+            .count();
+        let fail = self
+            .entries
+            .iter()
+            .filter(|e| matches!(e.completion, Some((false, _))))
+            .count();
+        let elapsed_secs: u64 = self
+            .entries
+            .iter()
+            .filter_map(|e| e.completion.map(|(_, s)| s))
+            .sum();
+
+        if done < total {
+            // Still running: 🔄 Running 3/5 tools | ✅ 2 ❌ 1 | 8s
+            let _ = write!(out, "\u{1f504} Running {done}/{total} tools");
+        } else {
+            // All done: ✅ 5/5 tools done | ✅ 4 ❌ 1 | 12s
+            let _ = write!(out, "\u{2705} {total}/{total} tools done");
+        }
+        if ok > 0 || fail > 0 {
+            let _ = write!(out, " |");
+            if ok > 0 {
+                let _ = write!(out, " \u{2705}{ok}");
+            }
+            if fail > 0 {
+                let _ = write!(out, " \u{274c}{fail}");
+            }
+        }
+        let _ = writeln!(out, " | {elapsed_secs}s");
+
+        // ── Per-tool lines ────────────────────────────────────
         for entry in &self.entries {
+            let hint_suffix = if entry.hint.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", entry.hint)
+            };
             match entry.completion {
                 None => {
-                    let _ = write!(out, "\u{23f3} {}", entry.name);
-                    if !entry.hint.is_empty() {
-                        let _ = write!(out, ": {}", entry.hint);
-                    }
-                    out.push('\n');
+                    let _ = writeln!(out, "\u{23f3} {}{hint_suffix}", entry.name);
                 }
                 Some((true, secs)) => {
-                    let _ = writeln!(out, "\u{2705} {} ({secs}s)", entry.name);
+                    let _ = writeln!(out, "\u{2705} {}{hint_suffix} ({secs}s)", entry.name);
                 }
                 Some((false, secs)) => {
-                    let _ = writeln!(out, "\u{274c} {} ({secs}s)", entry.name);
+                    let _ = writeln!(out, "\u{274c} {}{hint_suffix} ({secs}s)", entry.name);
                 }
             }
         }
@@ -1847,10 +1891,21 @@ pub async fn run_tool_call_loop(
             return Ok(display_text);
         }
 
-        // Print any text the LLM produced alongside tool calls (unless silent)
-        if !silent && !display_text.is_empty() {
-            print!("{display_text}");
-            let _ = std::io::stdout().flush();
+        // Print any text the LLM produced alongside tool calls (unless silent).
+        // When a streaming delta sender is available (non-CLI channels), relay the
+        // intermediate text as a progress line so channels like Slack/Telegram can
+        // show the LLM's reasoning/planning alongside tool-call progress — matching
+        // the CLI experience where this text is printed to stdout.
+        if !display_text.is_empty() {
+            if !silent {
+                print!("{display_text}");
+                let _ = std::io::stdout().flush();
+            }
+            if let Some(ref tx) = on_delta {
+                let _ = tx
+                    .send(format!("{DRAFT_PROGRESS_SENTINEL}{display_text}\n"))
+                    .await;
+            }
         }
 
         // Execute tool calls and build results. `individual_results` tracks per-call output so
