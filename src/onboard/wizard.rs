@@ -4781,6 +4781,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     channel_ids: vec![],
                     allowed_users,
                     group_reply: None,
+                    stream_mode: StreamMode::default(),
+                    draft_update_interval_ms: 1000,
+                    progress_mode: ProgressMode::default(),
                 });
             }
             ChannelMenuChoice::IMessage => {

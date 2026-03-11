@@ -243,6 +243,9 @@ bot_token = "xoxb-..."
 app_token = "xapp-..."             # optional
 channel_id = "C1234567890"         # optional: single channel; omit or "*" for all accessible channels
 allowed_users = ["*"]
+stream_mode = "off"                # optional: off | partial
+draft_update_interval_ms = 1000   # optional: minimum ms between draft edits (default 1000)
+progress_mode = "compact"          # optional: verbose | compact | off (default compact)
 
 [channels_config.slack.group_reply]
 mode = "all_messages"              # optional: all_messages | mention_only
@@ -253,6 +256,13 @@ Slack listen behavior:
 
 - `channel_id = "C123..."`: listen only on that channel.
 - `channel_id = "*"` or omitted: auto-discover and listen across all accessible channels.
+
+Slack streaming (progressive draft updates):
+
+- `stream_mode = "partial"`: send an initial draft message and progressively update it as the response is generated, then finalize with full Slack mrkdwn formatting.
+- `stream_mode = "off"` (default): send the complete response as a single message.
+- `draft_update_interval_ms`: minimum interval between `chat.update` calls to stay within Slack rate limits. Default `1000` ms.
+- `progress_mode`: controls visibility of tool-execution progress lines during streaming. `verbose` shows all progress, `compact` (default) shows tool lifecycle only, `off` suppresses progress lines entirely.
 
 ### 4.4 Mattermost
 

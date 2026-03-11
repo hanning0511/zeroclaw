@@ -1,9 +1,11 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use crate::config::schema::StreamMode;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::header::HeaderMap;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -24,8 +26,12 @@ pub struct SlackChannel {
     mention_only: bool,
     group_reply_allowed_sender_ids: Vec<String>,
     user_display_name_cache: Mutex<HashMap<String, CachedSlackDisplayName>>,
+    stream_mode: StreamMode,
+    draft_update_interval_ms: u64,
+    last_draft_edit: Mutex<HashMap<String, Instant>>,
 }
 
+const SLACK_MAX_MESSAGE_LENGTH: usize = 40_000;
 const SLACK_HISTORY_MAX_RETRIES: u32 = 3;
 const SLACK_HISTORY_DEFAULT_RETRY_AFTER_SECS: u64 = 1;
 const SLACK_HISTORY_MAX_BACKOFF_SECS: u64 = 120;
@@ -49,7 +55,21 @@ impl SlackChannel {
             mention_only: false,
             group_reply_allowed_sender_ids: Vec::new(),
             user_display_name_cache: Mutex::new(HashMap::new()),
+            stream_mode: StreamMode::Off,
+            draft_update_interval_ms: 1000,
+            last_draft_edit: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Configure streaming mode for progressive draft updates.
+    pub fn with_streaming(
+        mut self,
+        stream_mode: StreamMode,
+        draft_update_interval_ms: u64,
+    ) -> Self {
+        self.stream_mode = stream_mode;
+        self.draft_update_interval_ms = draft_update_interval_ms;
+        self
     }
 
     /// Configure group-chat trigger policy.
@@ -813,9 +833,13 @@ impl Channel for SlackChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        // Strip tool-call XML tags, then convert standard Markdown → Slack mrkdwn.
+        let content = super::strip_tool_call_tags(&message.content);
+        let content = markdown_to_slack_mrkdwn(&content);
+
         let mut body = serde_json::json!({
             "channel": message.recipient,
-            "text": message.content
+            "text": content
         });
 
         if let Some(ref ts) = message.thread_ts {
@@ -1018,6 +1042,755 @@ impl Channel for SlackChannel {
             .map(|r| r.status().is_success())
             .unwrap_or(false)
     }
+
+    fn supports_draft_updates(&self) -> bool {
+        self.stream_mode != StreamMode::Off
+    }
+
+    async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        if self.stream_mode == StreamMode::Off {
+            return Ok(None);
+        }
+
+        let initial_text = if message.content.is_empty() {
+            "...".to_string()
+        } else {
+            message.content.clone()
+        };
+
+        let mut body = serde_json::json!({
+            "channel": message.recipient,
+            "text": initial_text
+        });
+        if let Some(ref ts) = message.thread_ts {
+            body["thread_ts"] = serde_json::json!(ts);
+        }
+
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/chat.postMessage")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let resp_body = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+
+        if !status.is_success() {
+            let sanitized = crate::providers::sanitize_api_error(&resp_body);
+            anyhow::bail!("Slack chat.postMessage (draft) failed ({status}): {sanitized}");
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&resp_body).unwrap_or_default();
+        if parsed.get("ok") == Some(&serde_json::Value::Bool(false)) {
+            let err = parsed
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            anyhow::bail!("Slack chat.postMessage (draft) failed: {err}");
+        }
+
+        let ts = parsed.get("ts").and_then(|v| v.as_str()).map(String::from);
+
+        if let Some(ref ts_val) = ts {
+            if let Ok(mut edits) = self.last_draft_edit.lock() {
+                edits.insert(message.recipient.clone(), Instant::now());
+            }
+            tracing::debug!("Slack draft sent to {}, ts={ts_val}", message.recipient);
+        }
+
+        Ok(ts)
+    }
+
+    async fn update_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<Option<String>> {
+        {
+            if let Ok(edits) = self.last_draft_edit.lock() {
+                if let Some(last_time) = edits.get(recipient) {
+                    let elapsed =
+                        u64::try_from(last_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    if elapsed < self.draft_update_interval_ms {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+
+        let display_text = if text.len() > SLACK_MAX_MESSAGE_LENGTH {
+            let mut end = 0;
+            for (idx, ch) in text.char_indices() {
+                let next = idx + ch.len_utf8();
+                if next > SLACK_MAX_MESSAGE_LENGTH {
+                    break;
+                }
+                end = next;
+            }
+            &text[..end]
+        } else {
+            text
+        };
+
+        let body = serde_json::json!({
+            "channel": recipient,
+            "ts": message_id,
+            "text": display_text,
+        });
+
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/chat.update")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            if let Ok(mut edits) = self.last_draft_edit.lock() {
+                edits.insert(recipient.to_string(), Instant::now());
+            }
+        } else {
+            let status = resp.status();
+            let err = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            let sanitized = crate::providers::sanitize_api_error(&err);
+            tracing::debug!("Slack chat.update failed ({status}): {sanitized}");
+        }
+
+        Ok(None)
+    }
+
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        if let Ok(mut edits) = self.last_draft_edit.lock() {
+            edits.remove(recipient);
+        }
+
+        let text = &super::strip_tool_call_tags(text);
+        let formatted = markdown_to_slack_mrkdwn(text);
+
+        if formatted.len() <= SLACK_MAX_MESSAGE_LENGTH {
+            let body = serde_json::json!({
+                "channel": recipient,
+                "ts": message_id,
+                "text": formatted,
+            });
+
+            let resp = self
+                .http_client()
+                .post("https://slack.com/api/chat.update")
+                .bearer_auth(&self.bot_token)
+                .json(&body)
+                .send()
+                .await?;
+
+            let status = resp.status();
+            let resp_body = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+
+            let parsed: serde_json::Value = serde_json::from_str(&resp_body).unwrap_or_default();
+            if status.is_success() && parsed.get("ok") != Some(&serde_json::Value::Bool(false)) {
+                return Ok(());
+            }
+
+            tracing::debug!(
+                "Slack finalize_draft chat.update failed ({status}); falling back to delete+send"
+            );
+        }
+
+        let _ = self
+            .http_client()
+            .post("https://slack.com/api/chat.delete")
+            .bearer_auth(&self.bot_token)
+            .json(&serde_json::json!({
+                "channel": recipient,
+                "ts": message_id,
+            }))
+            .send()
+            .await;
+
+        self.send(&SendMessage::new(&formatted, recipient)).await
+    }
+
+    async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        if let Ok(mut edits) = self.last_draft_edit.lock() {
+            edits.remove(recipient);
+        }
+
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/chat.delete")
+            .bearer_auth(&self.bot_token)
+            .json(&serde_json::json!({
+                "channel": recipient,
+                "ts": message_id,
+            }))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            let sanitized = crate::providers::sanitize_api_error(&body);
+            tracing::debug!("Slack chat.delete failed ({status}): {sanitized}");
+        }
+
+        Ok(())
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Markdown → Slack mrkdwn converter
+// ══════════════════════════════════════════════════════════════════════════
+//
+// Slack uses its own "mrkdwn" format that differs from standard Markdown:
+//   • Bold:          *text*   (not **text**)
+//   • Italic:        _text_   (not *text*)
+//   • Strikethrough: ~text~   (not ~~text~~)
+//   • Links:         <url|text> (not [text](url))
+//   • Headers:       not supported — use *SECTION NAME* on its own line
+//   • Bullets:       • item   (not - item)
+//   • Code/blocks:   `code` and ```code``` (same as Markdown)
+//
+// This converter is a safety net applied in `send()`: the LLM is still
+// prompted (via `channel_delivery_instructions`) to output Slack mrkdwn
+// directly, but when it falls back to standard Markdown (which happens
+// frequently in tool outputs and complex responses), this function catches
+// and converts the formatting.
+//
+// The converter is idempotent for most Slack mrkdwn constructs: `_text_`
+// (italic), `~text~` (strikethrough), `<url|text>` (links), and `\`code\``
+// all pass through unchanged.  The one intentional non-idempotent transform
+// is single-asterisk `*text*`: because this is standard Markdown italic,
+// and Slack interprets `*text*` as bold, the converter rewrites it to
+// `_text_` (Slack italic) so the author's intent is preserved.
+//
+// Architecture mirrors ZeroClaw's Telegram `markdown_to_telegram_html`:
+// two-pass (per-line inline formatting, then cross-line code blocks).
+// Ported from NVCortex's Slack formatting guidelines (base.md).
+
+/// Convert standard Markdown formatting to Slack mrkdwn.
+///
+/// Handles: bold (`**` / `__`), italic (`*` → `_`), bold-italic (`***`),
+/// strikethrough (`~~`), headers (`#`), links (`[text](url)`),
+/// images (`![alt](url)`), bullet points (`-` / `*`), bare URLs, and
+/// tables.  Code blocks and inline code are preserved verbatim.
+fn markdown_to_slack_mrkdwn(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+
+    // ── Pass 1: per-line inline formatting ──────────────────────────
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut result_lines: Vec<String> = Vec::with_capacity(lines.len());
+    let mut in_code_block = false;
+
+    for line in &lines {
+        let trimmed = line.trim_start();
+
+        // Track fenced code block boundaries.
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            result_lines.push(line.to_string());
+            continue;
+        }
+
+        // Inside a fenced code block: preserve verbatim.
+        if in_code_block {
+            result_lines.push(line.to_string());
+            continue;
+        }
+
+        // ── Horizontal rules: ---, ***, ___ → ─── visual separator ──
+        if is_horizontal_rule(trimmed) {
+            result_lines.push("───────────────────────".to_string());
+            continue;
+        }
+
+        // ── Headers: # Heading → *HEADING* ──────────────────────────
+        if line.starts_with('#') {
+            let stripped = line.trim_start_matches('#');
+            let header_level = line.len() - stripped.len();
+            if header_level > 0 && stripped.starts_with(' ') {
+                // Strip bold markers from header text: ## **Title** → TITLE
+                let title = strip_inline_bold(stripped.trim());
+                let formatted = if header_level <= 2 {
+                    format!("*{}*", title.to_uppercase())
+                } else {
+                    format!("*{title}*")
+                };
+                result_lines.push(formatted);
+                continue;
+            }
+        }
+
+        // ── Inline formatting ───────────────────────────────────────
+        let out = convert_inline_formatting(line);
+
+        // ── Bullet points & ordered lists ───────────────────────────
+        result_lines.push(convert_list_item(&out));
+    }
+
+    // ── Pass 2: tables → bullet lists ───────────────────────────────
+    let joined = result_lines.join("\n");
+    let after_tables = convert_tables(&joined);
+
+    // ── Pass 3: wrap bare URLs ──────────────────────────────────────
+    let final_text = wrap_bare_urls(&after_tables);
+
+    final_text.trim_end_matches('\n').to_string()
+}
+
+/// Convert inline Markdown formatting in a single line to Slack mrkdwn.
+///
+/// Handles bold, italic, strikethrough, inline code, links, and images.
+/// Inline code spans are detected first and preserved verbatim so that
+/// formatting markers inside backticks are not converted.
+fn convert_inline_formatting(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        // ── Inline code: `code` — preserve verbatim ─────────────
+        if bytes[i] == b'`' && !(i + 2 < len && bytes[i + 1] == b'`' && bytes[i + 2] == b'`') {
+            if let Some(end) = line[i + 1..].find('`') {
+                let span = &line[i..i + 2 + end];
+                out.push_str(span);
+                i += 2 + end;
+                continue;
+            }
+        }
+
+        // ── Bold-italic: ***text*** → *_text_* ─────────────────
+        // Must check before bold (**) to avoid partial match.
+        if i + 2 < len && bytes[i] == b'*' && bytes[i + 1] == b'*' && bytes[i + 2] == b'*' {
+            if let Some(end) = find_closing_marker(&line[i + 3..], "***") {
+                if end > 0 {
+                    let inner = &line[i + 3..i + 3 + end];
+                    let _ = write!(out, "*_{inner}_*");
+                    i += 6 + end;
+                    continue;
+                }
+            }
+        }
+
+        // ── Bold: **text** → *text* ─────────────────────────────
+        // Recursively convert inner content so that nested single-*
+        // markers inside bold spans do not break Slack rendering.
+        if i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'*' {
+            if let Some(end) = find_closing_marker(&line[i + 2..], "**") {
+                if end > 0 {
+                    let inner = &line[i + 2..i + 2 + end];
+                    let converted_inner = convert_bold_inner(inner);
+                    let _ = write!(out, "*{converted_inner}*");
+                    i += 4 + end;
+                    continue;
+                }
+            }
+        }
+
+        // ── Italic: *text* → _text_ ────────────────────────────
+        // Standard Markdown italic (single asterisk) must become
+        // Slack italic (underscore), because Slack *text* = bold.
+        //
+        // Matching rules (mirrors CommonMark flanking delimiter):
+        //   • The character after the opening `*` must be non-whitespace.
+        //   • The character before the closing `*` must be non-whitespace.
+        // This prevents `* bullet item` or `5 * 3 * 2` from being
+        // misinterpreted as italic.
+        if bytes[i] == b'*' {
+            // Opening `*` must be followed by non-whitespace.
+            if i + 1 < len && !bytes[i + 1].is_ascii_whitespace() {
+                if let Some(end) = find_closing_marker(&line[i + 1..], "*") {
+                    // end > 0 ensures non-empty content; check that the
+                    // character before the closing `*` is non-whitespace.
+                    if end > 0 && !line.as_bytes()[i + end].is_ascii_whitespace() {
+                        let inner = &line[i + 1..i + 1 + end];
+                        let _ = write!(out, "_{inner}_");
+                        i += 2 + end;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // ── Bold: __text__ → *text* ─────────────────────────────
+        if i + 1 < len && bytes[i] == b'_' && bytes[i + 1] == b'_' {
+            if let Some(end) = find_closing_marker(&line[i + 2..], "__") {
+                if end > 0 {
+                    let inner = &line[i + 2..i + 2 + end];
+                    let _ = write!(out, "*{inner}*");
+                    i += 4 + end;
+                    continue;
+                }
+            }
+        }
+
+        // ── Strikethrough: ~~text~~ → ~text~ ────────────────────
+        if i + 1 < len && bytes[i] == b'~' && bytes[i + 1] == b'~' {
+            if let Some(end) = find_closing_marker(&line[i + 2..], "~~") {
+                if end > 0 {
+                    let inner = &line[i + 2..i + 2 + end];
+                    let _ = write!(out, "~{inner}~");
+                    i += 4 + end;
+                    continue;
+                }
+            }
+        }
+
+        // ── Image link: ![alt](url) → <url> ────────────────────
+        if bytes[i] == b'!' && i + 1 < len && bytes[i + 1] == b'[' {
+            if let Some(bracket_end) = line[i + 2..].find(']') {
+                let after_bracket = i + 2 + bracket_end + 1;
+                if after_bracket < len && bytes[after_bracket] == b'(' {
+                    if let Some(paren_end) = line[after_bracket + 1..].find(')') {
+                        let url = &line[after_bracket + 1..after_bracket + 1 + paren_end];
+                        let _ = write!(out, "<{url}>");
+                        i = after_bracket + 1 + paren_end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // ── Link: [text](url) → <url|text> ─────────────────────
+        if bytes[i] == b'[' {
+            if let Some(bracket_end) = line[i + 1..].find(']') {
+                let text_part = &line[i + 1..i + 1 + bracket_end];
+                let after_bracket = i + 1 + bracket_end + 1;
+                if after_bracket < len && bytes[after_bracket] == b'(' {
+                    if let Some(paren_end) = line[after_bracket + 1..].find(')') {
+                        let url = &line[after_bracket + 1..after_bracket + 1 + paren_end];
+                        if url.starts_with("http://") || url.starts_with("https://") {
+                            let _ = write!(out, "<{url}|{text_part}>");
+                            i = after_bracket + 1 + paren_end + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Default: pass character through ─────────────────────
+        let ch = line[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
+/// Find the position of a closing marker in `text`, skipping over inline
+/// code spans (backtick-delimited).  Returns the byte offset of the marker
+/// start relative to `text`, or `None` if not found.
+///
+/// This prevents formatting markers inside inline code from being treated
+/// as closing delimiters (e.g. `**see `*note*` here**` should close at the
+/// final `**`, not at the `*` inside backticks).
+fn find_closing_marker(text: &str, marker: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let marker_bytes = marker.as_bytes();
+    let marker_len = marker_bytes.len();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        // Skip inline code spans.
+        if bytes[i] == b'`' {
+            if let Some(end) = text[i + 1..].find('`') {
+                i += 2 + end;
+                continue;
+            }
+        }
+        // Check for marker match.
+        if i + marker_len <= len && &bytes[i..i + marker_len] == marker_bytes {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Convert inner content of a `**bold**` span to be safe for Slack `*...*`.
+///
+/// Inside a Slack bold span (`*...*`), any literal `*` would prematurely
+/// close the bold.  The only Markdown formatting that can appear inside a
+/// bold span and uses `*` is single-asterisk italic (`*text*`).  We convert
+/// those to Slack italic (`_text_`) so the enclosing `*...*` is not broken.
+fn convert_bold_inner(inner: &str) -> String {
+    let bytes = inner.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+
+    while i < len {
+        // Preserve inline code verbatim.
+        if bytes[i] == b'`' {
+            if let Some(end) = inner[i + 1..].find('`') {
+                out.push_str(&inner[i..i + 2 + end]);
+                i += 2 + end;
+                continue;
+            }
+        }
+        // Convert nested italic *text* → _text_ inside the bold span.
+        if bytes[i] == b'*' {
+            if let Some(end) = find_closing_marker(&inner[i + 1..], "*") {
+                if end > 0 {
+                    let italic_inner = &inner[i + 1..i + 1 + end];
+                    let _ = write!(out, "_{italic_inner}_");
+                    i += 2 + end;
+                    continue;
+                }
+            }
+        }
+        let ch = inner[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Check if a line is a Markdown horizontal rule: `---`, `***`, `___`
+/// (three or more of the same character, optionally with spaces).
+fn is_horizontal_rule(trimmed: &str) -> bool {
+    if trimmed.len() < 3 {
+        return false;
+    }
+    let without_spaces: String = trimmed.chars().filter(|c| *c != ' ').collect();
+    if without_spaces.len() < 3 {
+        return false;
+    }
+    let first = without_spaces.as_bytes()[0];
+    matches!(first, b'-' | b'*' | b'_') && without_spaces.bytes().all(|b| b == first)
+}
+
+/// Strip bold markers from text: `**Title**` → `Title`, `__Title__` → `Title`.
+/// Used to clean up header text that contains inline bold markers.
+fn strip_inline_bold(text: &str) -> String {
+    let mut result = text.to_string();
+    // Remove ** pairs
+    while let (Some(_), Some(_)) = (result.find("**"), result.rfind("**")) {
+        if result.find("**") == result.rfind("**") {
+            break; // only one ** found, not a pair
+        }
+        result = result.replacen("**", "", 1);
+        // Remove the last occurrence
+        if let Some(pos) = result.rfind("**") {
+            result.replace_range(pos..pos + 2, "");
+        }
+    }
+    // Remove __ pairs
+    while let (Some(start), Some(end)) = (result.find("__"), result.rfind("__")) {
+        if start == end {
+            break;
+        }
+        result = result.replacen("__", "", 1);
+        if let Some(pos) = result.rfind("__") {
+            result.replace_range(pos..pos + 2, "");
+        }
+    }
+    result
+}
+
+/// Convert `- item` / `* item` → `• item`, and `1. item` → `1.  item`
+/// (preserving ordered list numbers with consistent alignment).
+fn convert_list_item(line: &str) -> String {
+    let trimmed = line.trim_start();
+    let indent = &line[..line.len() - trimmed.len()];
+
+    // Unordered bullets: - item / * item → • item
+    if let Some(rest) = trimmed.strip_prefix("- ") {
+        return format!("{indent}• {rest}");
+    }
+    if let Some(rest) = trimmed.strip_prefix("* ") {
+        return format!("{indent}• {rest}");
+    }
+
+    // Ordered lists: 1. item → 1.  item (Slack doesn't render numbered
+    // lists natively, so we keep the number but ensure consistent spacing).
+    if let Some(dot_pos) = trimmed.find(". ") {
+        let prefix = &trimmed[..dot_pos];
+        if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()) {
+            let rest = &trimmed[dot_pos + 2..];
+            return format!("{indent}{prefix}.  {rest}");
+        }
+    }
+
+    line.to_string()
+}
+
+/// Convert Markdown tables to Slack-friendly bullet-point lists.
+///
+/// | Name  | Age | Role |
+/// |-------|-----|------|
+/// | Alice | 30  | Eng  |
+///
+/// →
+///
+/// *Name* | *Age* | *Role*
+/// • Alice | 30 | Eng
+fn convert_tables(text: &str) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut result: Vec<String> = Vec::new();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+        if !trimmed.starts_with('|') {
+            result.push(lines[i].to_string());
+            i += 1;
+            continue;
+        }
+
+        // Collect consecutive table lines.
+        let mut table_lines: Vec<&str> = Vec::new();
+        while i < lines.len() && lines[i].trim().starts_with('|') {
+            table_lines.push(lines[i].trim());
+            i += 1;
+        }
+
+        if table_lines.len() < 2 {
+            result.extend(table_lines.iter().map(|l| l.to_string()));
+            continue;
+        }
+
+        // Parse header and data rows, skipping separator rows (|---|---|).
+        let mut header: Option<Vec<String>> = None;
+        let mut data_rows: Vec<Vec<String>> = Vec::new();
+
+        for tl in &table_lines {
+            let stripped = tl.trim().trim_matches('|');
+            // Detect separator: all cells are dashes/colons only.
+            let is_separator = stripped.split('|').all(|cell| {
+                let c = cell.trim();
+                !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':' || ch == ' ')
+            });
+            if is_separator {
+                continue;
+            }
+
+            let cells: Vec<String> = stripped.split('|').map(|c| c.trim().to_string()).collect();
+            if header.is_none() {
+                header = Some(cells);
+            } else {
+                data_rows.push(cells);
+            }
+        }
+
+        if let Some(hdr) = header {
+            let header_str = hdr
+                .iter()
+                .map(|h| format!("*{h}*"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            result.push(header_str);
+            for row in &data_rows {
+                result.push(format!("• {}", row.join(" | ")));
+            }
+        } else {
+            result.extend(table_lines.iter().map(|l| l.to_string()));
+        }
+    }
+
+    result.join("\n")
+}
+
+/// Wrap bare `http://` and `https://` URLs in angle brackets (`<url>`)
+/// unless they are already inside a Slack link (`<url|text>` or `<url>`),
+/// inside inline code, or inside a fenced code block.
+fn wrap_bare_urls(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut in_code_block = false;
+    let mut first_line = true;
+
+    for line in text.split('\n') {
+        if !first_line {
+            result.push('\n');
+        }
+        first_line = false;
+
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            result.push_str(line);
+            continue;
+        }
+        if in_code_block {
+            result.push_str(line);
+            continue;
+        }
+
+        let bytes = line.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+        let mut in_inline_code = false;
+
+        while i < len {
+            if bytes[i] == b'`' {
+                in_inline_code = !in_inline_code;
+                result.push('`');
+                i += 1;
+                continue;
+            }
+
+            if in_inline_code {
+                let ch = line[i..].chars().next().unwrap();
+                result.push(ch);
+                i += ch.len_utf8();
+                continue;
+            }
+
+            // Detect URL start.
+            if (line[i..].starts_with("http://") || line[i..].starts_with("https://"))
+                && (i == 0 || !matches!(bytes[i - 1], b'<' | b'|' | b'(' | b'"' | b'\''))
+            {
+                let url_start = i;
+                let mut url_end = i;
+                for &b in &bytes[i..] {
+                    if matches!(b, b' ' | b'\t' | b'>' | b')' | b']' | b'\n') {
+                        break;
+                    }
+                    url_end += 1;
+                }
+
+                let url = &line[url_start..url_end];
+                let already_wrapped = url_start > 0 && bytes[url_start - 1] == b'<';
+                if already_wrapped {
+                    result.push_str(url);
+                } else {
+                    let _ = write!(result, "<{url}>");
+                }
+                i = url_end;
+                continue;
+            }
+
+            let ch = line[i..].chars().next().unwrap();
+            result.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -1420,5 +2193,474 @@ mod tests {
     fn compute_retry_delay_applies_backoff_and_jitter_with_cap() {
         let delay = SlackChannel::compute_retry_delay(30, 3, 250);
         assert_eq!(delay, Duration::from_secs(120) + Duration::from_millis(250));
+    }
+
+    // ── markdown_to_slack_mrkdwn tests ──────────────────────────────
+
+    #[test]
+    fn mrkdwn_empty_passthrough() {
+        assert_eq!(markdown_to_slack_mrkdwn(""), "");
+    }
+
+    #[test]
+    fn mrkdwn_plain_text_passthrough() {
+        let text = "Hello world, this is a normal message.";
+        assert_eq!(markdown_to_slack_mrkdwn(text), text);
+    }
+
+    #[test]
+    fn mrkdwn_bold_double_asterisk() {
+        assert_eq!(markdown_to_slack_mrkdwn("**bold text**"), "*bold text*");
+    }
+
+    #[test]
+    fn mrkdwn_bold_double_underscore() {
+        assert_eq!(markdown_to_slack_mrkdwn("__bold text__"), "*bold text*");
+    }
+
+    #[test]
+    fn mrkdwn_single_asterisk_to_italic() {
+        // Single-asterisk *text* is standard Markdown italic.
+        // Slack uses *text* for bold, so we must convert to _text_ (Slack italic).
+        assert_eq!(markdown_to_slack_mrkdwn("*italic text*"), "_italic text_");
+    }
+
+    #[test]
+    fn mrkdwn_bold_and_italic_in_same_line() {
+        // **bold** → *bold* (Slack bold), *italic* → _italic_ (Slack italic)
+        assert_eq!(
+            markdown_to_slack_mrkdwn("**bold** and *italic*"),
+            "*bold* and _italic_"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_strikethrough() {
+        assert_eq!(
+            markdown_to_slack_mrkdwn("~~deleted text~~"),
+            "~deleted text~"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_header_h1() {
+        assert_eq!(markdown_to_slack_mrkdwn("# Main Title"), "*MAIN TITLE*");
+    }
+
+    #[test]
+    fn mrkdwn_header_h2() {
+        assert_eq!(markdown_to_slack_mrkdwn("## Section"), "*SECTION*");
+    }
+
+    #[test]
+    fn mrkdwn_header_h3_preserves_case() {
+        assert_eq!(markdown_to_slack_mrkdwn("### Sub Section"), "*Sub Section*");
+    }
+
+    #[test]
+    fn mrkdwn_link_conversion() {
+        assert_eq!(
+            markdown_to_slack_mrkdwn("[Click here](https://example.com)"),
+            "<https://example.com|Click here>"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_image_link() {
+        assert_eq!(
+            markdown_to_slack_mrkdwn("![alt text](https://img.example.com/pic.png)"),
+            "<https://img.example.com/pic.png>"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_bullet_dash() {
+        assert_eq!(markdown_to_slack_mrkdwn("- item one"), "• item one");
+    }
+
+    #[test]
+    fn mrkdwn_bullet_asterisk() {
+        assert_eq!(markdown_to_slack_mrkdwn("* item one"), "• item one");
+    }
+
+    #[test]
+    fn mrkdwn_nested_bullet() {
+        assert_eq!(
+            markdown_to_slack_mrkdwn("  - nested item"),
+            "  • nested item"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_inline_code_preserved() {
+        assert_eq!(
+            markdown_to_slack_mrkdwn("Use `git status` to check"),
+            "Use `git status` to check"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_code_block_preserved() {
+        let input = "```rust\nfn main() {\n    println!(\"hello\");\n}\n```";
+        let output = markdown_to_slack_mrkdwn(input);
+        assert!(output.contains("```rust"));
+        assert!(output.contains("fn main()"));
+        assert!(output.contains("println!"));
+    }
+
+    #[test]
+    fn mrkdwn_no_formatting_inside_code_block() {
+        let input = "```\n**bold** and *italic* inside code\n```";
+        let output = markdown_to_slack_mrkdwn(input);
+        assert!(
+            output.contains("**bold**"),
+            "bold should be preserved in code block"
+        );
+        assert!(
+            output.contains("*italic*"),
+            "italic should be preserved in code block"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_inline_code_not_converted() {
+        let input = "Run `**not bold**` here";
+        let output = markdown_to_slack_mrkdwn(input);
+        assert!(output.contains("`**not bold**`"));
+    }
+
+    #[test]
+    fn mrkdwn_bare_url_wrapped() {
+        assert_eq!(
+            markdown_to_slack_mrkdwn("Visit https://example.com for more"),
+            "Visit <https://example.com> for more"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_already_wrapped_url_unchanged() {
+        let input = "Visit <https://example.com> for more";
+        assert_eq!(markdown_to_slack_mrkdwn(input), input);
+    }
+
+    #[test]
+    fn mrkdwn_slack_link_not_double_wrapped() {
+        let input = "<https://example.com|Example>";
+        assert_eq!(markdown_to_slack_mrkdwn(input), input);
+    }
+
+    #[test]
+    fn mrkdwn_table_conversion() {
+        let input = "| Name  | Age | Role |\n|-------|-----|------|\n| Alice | 30  | Eng  |\n| Bob   | 25  | PM   |";
+        let output = markdown_to_slack_mrkdwn(input);
+        assert!(output.contains("*Name*"));
+        assert!(output.contains("*Age*"));
+        assert!(output.contains("*Role*"));
+        assert!(output.contains("• Alice | 30 | Eng"));
+        assert!(output.contains("• Bob | 25 | PM"));
+    }
+
+    #[test]
+    fn mrkdwn_mixed_formatting() {
+        let input = "## Summary\n\nHere is a **bold** statement with a [link](https://example.com).\n\n- First item\n- Second item with `code`";
+        let output = markdown_to_slack_mrkdwn(input);
+        assert!(output.contains("*SUMMARY*"));
+        assert!(output.contains("*bold*"));
+        assert!(output.contains("<https://example.com|link>"));
+        assert!(output.contains("• First item"));
+        assert!(output.contains("`code`"));
+    }
+
+    // ── Horizontal rules ────────────────────────────────────────
+
+    #[test]
+    fn mrkdwn_horizontal_rule_dashes() {
+        assert_eq!(markdown_to_slack_mrkdwn("---"), "───────────────────────");
+    }
+
+    #[test]
+    fn mrkdwn_horizontal_rule_asterisks() {
+        assert_eq!(markdown_to_slack_mrkdwn("***"), "───────────────────────");
+    }
+
+    #[test]
+    fn mrkdwn_horizontal_rule_underscores() {
+        assert_eq!(markdown_to_slack_mrkdwn("___"), "───────────────────────");
+    }
+
+    #[test]
+    fn mrkdwn_horizontal_rule_long() {
+        assert_eq!(
+            markdown_to_slack_mrkdwn("----------"),
+            "───────────────────────"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_horizontal_rule_with_spaces() {
+        assert_eq!(markdown_to_slack_mrkdwn("- - -"), "───────────────────────");
+    }
+
+    #[test]
+    fn mrkdwn_horizontal_rule_in_context() {
+        let input = "Above\n\n---\n\nBelow";
+        let output = markdown_to_slack_mrkdwn(input);
+        assert!(output.contains("Above"));
+        assert!(output.contains("───────────────────────"));
+        assert!(output.contains("Below"));
+    }
+
+    // ── Headers with bold markers ───────────────────────────────
+
+    #[test]
+    fn mrkdwn_header_strips_bold_markers() {
+        assert_eq!(
+            markdown_to_slack_mrkdwn("## **Bold Title**"),
+            "*BOLD TITLE*"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_header_strips_underscore_bold() {
+        assert_eq!(
+            markdown_to_slack_mrkdwn("## __Bold Title__"),
+            "*BOLD TITLE*"
+        );
+    }
+
+    // ── Bold-italic (triple asterisks) ──────────────────────────
+
+    #[test]
+    fn mrkdwn_bold_italic_triple_asterisk() {
+        assert_eq!(
+            markdown_to_slack_mrkdwn("***bold italic***"),
+            "*_bold italic_*"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_bold_italic_in_sentence() {
+        assert_eq!(
+            markdown_to_slack_mrkdwn("This is ***important*** text"),
+            "This is *_important_* text"
+        );
+    }
+
+    // ── Mixed bold + italic on the same line ────────────────────
+
+    #[test]
+    fn mrkdwn_italic_then_bold_same_line() {
+        // *italic* first, then **bold** — both should render correctly.
+        assert_eq!(
+            markdown_to_slack_mrkdwn("*italic* and **bold**"),
+            "_italic_ and *bold*"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_bold_with_nested_italic() {
+        // **bold *nested italic* text** — inner *...* must become _..._
+        // so the enclosing *...* (Slack bold) is not broken.
+        assert_eq!(
+            markdown_to_slack_mrkdwn("**bold *nested* text**"),
+            "*bold _nested_ text*"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_multiple_bold_and_italic() {
+        // Multiple bold and italic segments on the same line.
+        assert_eq!(
+            markdown_to_slack_mrkdwn("**a** *b* **c** *d*"),
+            "*a* _b_ *c* _d_"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_italic_with_inline_code() {
+        // Inline code inside italic should be preserved.
+        assert_eq!(
+            markdown_to_slack_mrkdwn("*use `git status` to check*"),
+            "_use `git status` to check_"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_bold_then_italic_adjacent() {
+        // Adjacent bold and italic without space.
+        assert_eq!(
+            markdown_to_slack_mrkdwn("**bold***italic*"),
+            "*bold*_italic_"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_unmatched_single_asterisk() {
+        // A lone * without a closing pair should pass through as-is.
+        assert_eq!(markdown_to_slack_mrkdwn("5 * 3 = 15"), "5 * 3 = 15");
+    }
+
+    #[test]
+    fn mrkdwn_bullet_with_italic_content() {
+        // `* *italic* rest` — the leading `* ` is a bullet, inner *italic*
+        // should still convert to _italic_ after bullet conversion.
+        assert_eq!(
+            markdown_to_slack_mrkdwn("* *italic* rest"),
+            "• _italic_ rest"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_math_asterisks_not_italic() {
+        // Multiplication expressions should not be converted to italic.
+        assert_eq!(
+            markdown_to_slack_mrkdwn("result = a * b * c"),
+            "result = a * b * c"
+        );
+    }
+
+    // ── Ordered lists ───────────────────────────────────────────
+
+    #[test]
+    fn mrkdwn_ordered_list() {
+        let input = "1. First item\n2. Second item\n3. Third item";
+        let output = markdown_to_slack_mrkdwn(input);
+        assert!(output.contains("1.  First item"));
+        assert!(output.contains("2.  Second item"));
+        assert!(output.contains("3.  Third item"));
+    }
+
+    #[test]
+    fn mrkdwn_ordered_list_double_digit() {
+        assert_eq!(
+            markdown_to_slack_mrkdwn("10. Tenth item"),
+            "10.  Tenth item"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_ordered_list_nested() {
+        assert_eq!(
+            markdown_to_slack_mrkdwn("  1. Nested item"),
+            "  1.  Nested item"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_ordered_list_with_formatting() {
+        let input = "1. **Bold** first\n2. *Italic* second";
+        let output = markdown_to_slack_mrkdwn(input);
+        assert!(output.contains("1.  *Bold* first"));
+        // Single-asterisk *Italic* → _Italic_ (Slack italic)
+        assert!(output.contains("2.  _Italic_ second"));
+    }
+
+    // ── Realistic LLM output ────────────────────────────────────
+
+    #[test]
+    fn mrkdwn_realistic_llm_output() {
+        let input = "\
+## Summary
+
+Here are the results:
+
+---
+
+**Key findings:**
+
+1. First finding with **bold** emphasis
+2. Second finding with *italic* note
+3. Third finding
+
+---
+
+### Details
+
+- Item A
+- Item B
+
+***Note:*** this is important.";
+
+        let output = markdown_to_slack_mrkdwn(input);
+        assert!(output.contains("*SUMMARY*"), "header should be converted");
+        assert!(
+            output.contains("───────────────────────"),
+            "hr should be converted"
+        );
+        assert!(
+            output.contains("*Key findings:*"),
+            "bold should be converted"
+        );
+        assert!(
+            output.contains("1.  First finding with *bold* emphasis"),
+            "ordered list + bold"
+        );
+        assert!(
+            output.contains("2.  Second finding with _italic_ note"),
+            "ordered list + italic (single * → _ for Slack italic)"
+        );
+        assert!(output.contains("3.  Third finding"), "ordered list plain");
+        assert!(output.contains("*Details*"), "h3 should be converted");
+        assert!(output.contains("• Item A"), "bullets should be converted");
+        assert!(
+            output.contains("*_Note:_*"),
+            "bold-italic should be converted"
+        );
+    }
+
+    // ── Streaming / draft tests ───────────────────────────────────
+
+    #[test]
+    fn supports_draft_updates_off_by_default() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![]);
+        assert!(!ch.supports_draft_updates());
+    }
+
+    #[test]
+    fn supports_draft_updates_enabled_when_partial() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![])
+            .with_streaming(StreamMode::Partial, 1000);
+        assert!(ch.supports_draft_updates());
+    }
+
+    #[test]
+    fn with_streaming_configures_fields() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![])
+            .with_streaming(StreamMode::Partial, 500);
+        assert_eq!(ch.stream_mode, StreamMode::Partial);
+        assert_eq!(ch.draft_update_interval_ms, 500);
+    }
+
+    #[tokio::test]
+    async fn send_draft_returns_none_when_stream_mode_off() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![]);
+        let id = ch
+            .send_draft(&SendMessage::new("draft", "C123"))
+            .await
+            .unwrap();
+        assert!(id.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_draft_rate_limit_short_circuits() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![])
+            .with_streaming(StreamMode::Partial, 60_000);
+        ch.last_draft_edit
+            .lock()
+            .unwrap()
+            .insert("C123".to_string(), Instant::now());
+
+        let result = ch.update_draft("C123", "1234.5678", "text").await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn update_draft_utf8_truncation_is_safe() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![])
+            .with_streaming(StreamMode::Partial, 0);
+        let long_text = "\u{1F600}".repeat(SLACK_MAX_MESSAGE_LENGTH + 20);
+        let result = ch.update_draft("C123", "1234.5678", &long_text).await;
+        assert!(result.is_err() || result.is_ok());
     }
 }

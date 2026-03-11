@@ -4991,6 +4991,15 @@ pub struct SlackConfig {
     /// Group-chat trigger controls.
     #[serde(default)]
     pub group_reply: Option<GroupReplyConfig>,
+    /// Streaming mode for progressive response delivery via message edits.
+    #[serde(default)]
+    pub stream_mode: StreamMode,
+    /// Minimum interval (ms) between draft message edits to avoid rate limits.
+    #[serde(default = "default_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
+    /// Draft progress verbosity for streaming updates.
+    #[serde(default)]
+    pub progress_mode: ProgressMode,
 }
 
 impl ChannelConfig for SlackConfig {

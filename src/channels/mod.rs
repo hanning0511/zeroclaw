@@ -184,6 +184,23 @@ fn runtime_telegram_progress_mode() -> ProgressMode {
         .unwrap_or_else(|e| e.into_inner())
 }
 
+fn runtime_slack_progress_mode_store() -> &'static Mutex<ProgressMode> {
+    static STORE: OnceLock<Mutex<ProgressMode>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(ProgressMode::default()))
+}
+
+fn set_runtime_slack_progress_mode(mode: ProgressMode) {
+    *runtime_slack_progress_mode_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = mode;
+}
+
+fn runtime_slack_progress_mode() -> ProgressMode {
+    *runtime_slack_progress_mode_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 pub(crate) fn get_live_channel(name: &str) -> Option<Arc<dyn Channel>> {
     live_channels_registry()
         .lock()
@@ -561,6 +578,19 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Be concise and direct. Skip filler phrases.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
+        "slack" => Some(
+            "When responding on Slack, use Slack mrkdwn formatting (NOT standard Markdown):\n\
+             - Bold: *text* (NOT **text**)\n\
+             - Italic: _text_ (NOT *text* for italic)\n\
+             - No markdown headers (no # or ##) — use *SECTION NAME* on its own line instead\n\
+             - No markdown tables (no |---|) — use aligned bullet points instead\n\
+             - Bullet points: use • (not -)\n\
+             - Code: `backticks` or code blocks with triple backticks\n\
+             - Links: <url|text> (NOT [text](url)) — e.g. <https://github.com/foo|PR #123>; bare URLs wrap in angle brackets: <https://example.com>\n\
+             - Be concise and direct. Skip filler phrases like 'Great question!' or 'Certainly!'\n\
+             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.\n\
+             Note: standard Markdown formatting is auto-converted to Slack mrkdwn as a safety net, but prefer native Slack mrkdwn for best results.",
+        ),
         "bluebubbles" => Some(
             "You are responding on iMessage via BlueBubbles. Always complete your research before replying — use as many tool calls as needed to get a full, accurate answer.\n\
              \n\
@@ -736,6 +766,8 @@ fn effective_progress_mode_for_message(
         ProgressMode::Verbose
     } else if channel_name.eq_ignore_ascii_case("telegram") {
         runtime_telegram_progress_mode()
+    } else if channel_name.eq_ignore_ascii_case("slack") {
+        runtime_slack_progress_mode()
     } else {
         ProgressMode::Off
     }
@@ -4962,7 +4994,8 @@ fn collect_configured_channels(
                 .with_group_reply_policy(
                     sl.effective_group_reply_mode().requires_mention(),
                     sl.group_reply_allowed_sender_ids(),
-                ),
+                )
+                .with_streaming(sl.stream_mode, sl.draft_update_interval_ms),
             ),
         });
     }
@@ -5718,6 +5751,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .map(|tg| tg.progress_mode)
         .unwrap_or_default();
     set_runtime_telegram_progress_mode(telegram_progress_mode);
+
+    let slack_progress_mode = config
+        .channels_config
+        .slack
+        .as_ref()
+        .map(|sl| sl.progress_mode)
+        .unwrap_or_default();
+    set_runtime_slack_progress_mode(slack_progress_mode);
 
     let session_manager = shared_session_manager(&config.agent.session, &config.workspace_dir)?
         .map(|mgr| mgr as Arc<dyn SessionManager + Send + Sync>);
@@ -11656,6 +11697,20 @@ Done reminder set for 1:38 AM."#;
         set_runtime_telegram_progress_mode(ProgressMode::Off);
         assert_eq!(
             effective_progress_mode_for_message("telegram", false),
+            ProgressMode::Off
+        );
+    }
+
+    #[test]
+    fn effective_progress_mode_uses_slack_runtime_setting() {
+        set_runtime_slack_progress_mode(ProgressMode::Compact);
+        assert_eq!(
+            effective_progress_mode_for_message("slack", false),
+            ProgressMode::Compact
+        );
+        set_runtime_slack_progress_mode(ProgressMode::Off);
+        assert_eq!(
+            effective_progress_mode_for_message("slack", false),
             ProgressMode::Off
         );
     }
