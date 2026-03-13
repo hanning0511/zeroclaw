@@ -1362,7 +1362,13 @@ fn markdown_to_slack_mrkdwn(text: &str) -> String {
     let after_tables = convert_tables(&joined);
 
     // ── Pass 3: wrap bare URLs ──────────────────────────────────────
-    let final_text = wrap_bare_urls(&after_tables);
+    let after_urls = wrap_bare_urls(&after_tables);
+
+    // ── Pass 4: escape &, <, > for Slack ────────────────────────────
+    // Slack uses these as control characters; they must be HTML-entity
+    // encoded when they appear as literal text (not inside link syntax,
+    // code blocks, or blockquotes).
+    let final_text = escape_slack_entities(&after_urls);
 
     final_text.trim_end_matches('\n').to_string()
 }
@@ -1875,6 +1881,133 @@ fn wrap_bare_urls(text: &str) -> String {
             let ch = line[i..].chars().next().unwrap();
             result.push(ch);
             i += ch.len_utf8();
+        }
+    }
+
+    result
+}
+
+/// Escape `&`, `<`, and `>` to HTML entities for Slack.
+///
+/// Slack uses these characters as control characters for special parsing
+/// (links, mentions, dates).  Literal occurrences in normal text must be
+/// encoded as `&amp;`, `&lt;`, `&gt;` respectively.
+///
+/// Preserved contexts (NOT escaped):
+/// - Inside fenced code blocks (` ``` `)
+/// - Inside inline code spans (`` ` ``)
+/// - Inside Slack link/mention syntax (`<…>`)
+/// - The `>` at the start of a line (Slack blockquote)
+fn escape_slack_entities(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut in_code_block = false;
+    let mut first_line = true;
+
+    for line in text.split('\n') {
+        if !first_line {
+            result.push('\n');
+        }
+        first_line = false;
+
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            result.push_str(line);
+            continue;
+        }
+        if in_code_block {
+            result.push_str(line);
+            continue;
+        }
+
+        let bytes = line.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+        let mut in_inline_code = false;
+        let mut in_angle_bracket = false;
+
+        while i < len {
+            let b = bytes[i];
+
+            // Track inline code spans.
+            if b == b'`' {
+                in_inline_code = !in_inline_code;
+                result.push('`');
+                i += 1;
+                continue;
+            }
+
+            // Inside inline code: pass through verbatim.
+            if in_inline_code {
+                let ch = line[i..].chars().next().unwrap();
+                result.push(ch);
+                i += ch.len_utf8();
+                continue;
+            }
+
+            // Track Slack angle-bracket syntax: <url>, <url|text>,
+            // <@U...>, <#C...>, <!here>, <!date...>, <!subteam^...>,
+            // <mailto:...>.
+            // Only enter angle-bracket mode if the `<` is followed by a
+            // pattern that indicates valid Slack special syntax.  A bare
+            // `<` in text (e.g. `a < b`) must be escaped instead.
+            if b == b'<' && !in_angle_bracket {
+                let rest = &line[i + 1..];
+                let is_slack_syntax = rest.starts_with("http://")
+                    || rest.starts_with("https://")
+                    || rest.starts_with("mailto:")
+                    || rest.starts_with('@')
+                    || rest.starts_with('#')
+                    || rest.starts_with('!');
+                if is_slack_syntax {
+                    in_angle_bracket = true;
+                    result.push('<');
+                    i += 1;
+                    continue;
+                }
+            }
+            if b == b'>' && in_angle_bracket {
+                in_angle_bracket = false;
+                result.push('>');
+                i += 1;
+                continue;
+            }
+
+            // Inside angle-bracket syntax: pass through verbatim.
+            if in_angle_bracket {
+                let ch = line[i..].chars().next().unwrap();
+                result.push(ch);
+                i += ch.len_utf8();
+                continue;
+            }
+
+            // Blockquote `>` at line start: pass through.
+            if b == b'>' && i == 0 {
+                result.push('>');
+                i += 1;
+                continue;
+            }
+
+            // ── Escape the three Slack control characters ───────
+            match b {
+                b'&' => {
+                    result.push_str("&amp;");
+                    i += 1;
+                }
+                b'<' => {
+                    result.push_str("&lt;");
+                    i += 1;
+                }
+                b'>' => {
+                    result.push_str("&gt;");
+                    i += 1;
+                }
+                _ => {
+                    let ch = line[i..].chars().next().unwrap();
+                    result.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
         }
     }
 
@@ -2841,6 +2974,77 @@ Here are the results:
         assert_eq!(
             markdown_to_slack_mrkdwn("Use __bold__ here"),
             "Use *bold* here"
+        );
+    }
+
+    // ── Slack entity escaping (&, <, >) ────────────────────────────
+
+    #[test]
+    fn mrkdwn_ampersand_escaped() {
+        assert_eq!(
+            markdown_to_slack_mrkdwn("AT&T is a company"),
+            "AT&amp;T is a company"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_angle_brackets_escaped() {
+        assert_eq!(
+            markdown_to_slack_mrkdwn("a < b && c > d"),
+            "a &lt; b &amp;&amp; c &gt; d"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_slack_link_not_escaped() {
+        // Angle brackets in Slack link syntax must NOT be escaped.
+        assert_eq!(
+            markdown_to_slack_mrkdwn("[Click](https://example.com)"),
+            "<https://example.com|Click>"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_bare_url_angles_not_escaped() {
+        // Bare URL wrapping adds < > which must stay as-is.
+        assert_eq!(
+            markdown_to_slack_mrkdwn("Visit https://example.com today"),
+            "Visit <https://example.com> today"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_blockquote_gt_not_escaped() {
+        // > at line start is blockquote, not a control char.
+        assert_eq!(markdown_to_slack_mrkdwn("> quoted text"), "> quoted text");
+    }
+
+    #[test]
+    fn mrkdwn_inline_code_not_entity_escaped() {
+        // Inside inline code, & < > should NOT be escaped.
+        assert_eq!(
+            markdown_to_slack_mrkdwn("Use `a < b && c > d` in code"),
+            "Use `a < b && c > d` in code"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_code_block_not_entity_escaped() {
+        // Inside code blocks, & < > should NOT be escaped.
+        let input = "```\na < b && c > d\n```";
+        let output = markdown_to_slack_mrkdwn(input);
+        assert!(
+            output.contains("a < b && c > d"),
+            "code block content should not be entity-escaped"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_mixed_escaping_with_link() {
+        // Ampersand in text + link in same line.
+        assert_eq!(
+            markdown_to_slack_mrkdwn("Check AT&T at [their site](https://att.com)"),
+            "Check AT&amp;T at <https://att.com|their site>"
         );
     }
 
