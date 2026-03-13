@@ -579,17 +579,14 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
         "slack" => Some(
-            "When responding on Slack, use Slack mrkdwn formatting (NOT standard Markdown):\n\
-             - Bold: *text* (NOT **text**)\n\
-             - Italic: _text_ (NOT *text* for italic)\n\
-             - No markdown headers (no # or ##) — use *SECTION NAME* on its own line instead\n\
-             - No markdown tables (no |---|) — use aligned bullet points instead\n\
-             - Bullet points: use • (not -)\n\
+            "When responding on Slack, you may use either Slack mrkdwn or standard Markdown — both are auto-detected and converted correctly.\n\
+             Slack mrkdwn (preferred): *bold*, _italic_, ~strike~, <url|text>, `code`, • bullet\n\
+             Standard Markdown (also fine): **bold**, *italic*, ~~strike~~, [text](url), `code`, - bullet\n\
+             Avoid: markdown headers (# ##) — use *SECTION NAME* on its own line instead\n\
+             Avoid: markdown tables (|---|) — use aligned bullet points instead\n\
              - Code: `backticks` or code blocks with triple backticks\n\
-             - Links: <url|text> (NOT [text](url)) — e.g. <https://github.com/foo|PR #123>; bare URLs wrap in angle brackets: <https://example.com>\n\
              - Be concise and direct. Skip filler phrases like 'Great question!' or 'Certainly!'\n\
-             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.\n\
-             Note: standard Markdown formatting is auto-converted to Slack mrkdwn as a safety net, but prefer native Slack mrkdwn for best results.",
+             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
         "bluebubbles" => Some(
             "You are responding on iMessage via BlueBubbles. Always complete your research before replying — use as many tool calls as needed to get a full, accurate answer.\n\

@@ -1055,7 +1055,8 @@ impl Channel for SlackChannel {
         let initial_text = if message.content.is_empty() {
             "...".to_string()
         } else {
-            message.content.clone()
+            // Apply formatting so even the first draft frame renders properly.
+            markdown_to_slack_mrkdwn(&message.content)
         };
 
         let mut body = serde_json::json!({
@@ -1124,18 +1125,22 @@ impl Channel for SlackChannel {
             }
         }
 
-        let display_text = if text.len() > SLACK_MAX_MESSAGE_LENGTH {
+        // Apply formatting during streaming so users see properly rendered
+        // mrkdwn instead of raw Markdown while the response is being generated.
+        let formatted = markdown_to_slack_mrkdwn(text);
+
+        let display_text = if formatted.len() > SLACK_MAX_MESSAGE_LENGTH {
             let mut end = 0;
-            for (idx, ch) in text.char_indices() {
+            for (idx, ch) in formatted.char_indices() {
                 let next = idx + ch.len_utf8();
                 if next > SLACK_MAX_MESSAGE_LENGTH {
                     break;
                 }
                 end = next;
             }
-            &text[..end]
+            &formatted[..end]
         } else {
-            text
+            &formatted
         };
 
         let body = serde_json::json!({
@@ -1224,7 +1229,45 @@ impl Channel for SlackChannel {
             .send()
             .await;
 
-        self.send(&SendMessage::new(&formatted, recipient)).await
+        // Send the already-formatted text directly via chat.postMessage.
+        // Do NOT call self.send() here — it would apply markdown_to_slack_mrkdwn
+        // a second time, corrupting the already-converted mrkdwn.
+        let body = serde_json::json!({
+            "channel": recipient,
+            "text": formatted,
+        });
+
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/chat.postMessage")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let resp_body = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+
+        if !status.is_success() {
+            let sanitized = crate::providers::sanitize_api_error(&resp_body);
+            anyhow::bail!(
+                "Slack finalize_draft fallback postMessage failed ({status}): {sanitized}"
+            );
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&resp_body).unwrap_or_default();
+        if parsed.get("ok") == Some(&serde_json::Value::Bool(false)) {
+            let err = parsed
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            anyhow::bail!("Slack finalize_draft fallback postMessage failed: {err}");
+        }
+
+        Ok(())
     }
 
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
@@ -1258,7 +1301,7 @@ impl Channel for SlackChannel {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// Markdown → Slack mrkdwn converter
+// Markdown → Slack mrkdwn converter (with format detection)
 // ══════════════════════════════════════════════════════════════════════════
 //
 // Slack uses its own "mrkdwn" format that differs from standard Markdown:
@@ -1270,34 +1313,244 @@ impl Channel for SlackChannel {
 //   • Bullets:       • item   (not - item)
 //   • Code/blocks:   `code` and ```code``` (same as Markdown)
 //
-// This converter is a safety net applied in `send()`: the LLM is still
-// prompted (via `channel_delivery_instructions`) to output Slack mrkdwn
-// directly, but when it falls back to standard Markdown (which happens
-// frequently in tool outputs and complex responses), this function catches
-// and converts the formatting.
+// The converter uses a heuristic format-detection layer to determine
+// whether the input is standard Markdown, Slack mrkdwn, mixed, or plain
+// text.  This resolves the fundamental conflict between the system prompt
+// (which asks the LLM to output Slack mrkdwn) and the old converter
+// (which assumed all input was standard Markdown).
 //
-// The converter is idempotent for most Slack mrkdwn constructs: `_text_`
-// (italic), `~text~` (strikethrough), `<url|text>` (links), and `\`code\``
-// all pass through unchanged.  The one intentional non-idempotent transform
-// is single-asterisk `*text*`: because this is standard Markdown italic,
-// and Slack interprets `*text*` as bold, the converter rewrites it to
-// `_text_` (Slack italic) so the author's intent is preserved.
+// Detection signals (evaluated outside code blocks / inline code):
+//   Standard Markdown: **text**, __text__, [text](url), ## heading, ~~text~~, - item
+//   Slack mrkdwn:      <url|text>, • item, ~text~ (single-tilde)
+//   Ambiguous (ignored): *text*, _text_ (both formats use these differently)
 //
-// Architecture mirrors ZeroClaw's Telegram `markdown_to_telegram_html`:
-// two-pass (per-line inline formatting, then cross-line code blocks).
-// Ported from NVCortex's Slack formatting guidelines (base.md).
+// Conversion strategy by detected format:
+//   StandardMarkdown → full 4-pass conversion (inline, tables, URLs, escaping)
+//   SlackMrkdwn      → safe passes only (bare URLs + entity escaping)
+//   Mixed            → full conversion but skip single-* → _ (preserve *bold*)
+//   Plain            → entity escaping only
+
+/// Detected text format — drives conversion strategy.
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum TextFormat {
+    /// Clear standard Markdown signals (**, __, ##, [text](url), ~~).
+    StandardMarkdown,
+    /// Clear Slack mrkdwn signals (<url|text>, •) with no standard MD signals.
+    SlackMrkdwn,
+    /// Both standard Markdown and Slack mrkdwn signals present.
+    Mixed,
+    /// No formatting signals detected — plain text.
+    Plain,
+}
+
+/// Detect whether `text` is standard Markdown, Slack mrkdwn, mixed, or plain.
+///
+/// Scans outside code blocks/inline code for unambiguous format signals.
+/// Ambiguous markers (`*text*`, `_text_`) are ignored since both formats
+/// use them (with different semantics).  Returns early once both signal
+/// types are found (→ `Mixed`).
+fn detect_format(text: &str) -> TextFormat {
+    let mut has_md = false;
+    let mut has_mrkdwn = false;
+    let mut in_code_block = false;
+
+    for line in text.split('\n') {
+        let trimmed = line.trim_start();
+
+        // Track fenced code blocks — skip content inside them.
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if in_code_block {
+            continue;
+        }
+
+        // Work on bytes for efficient scanning, skipping inline code spans.
+        let bytes = line.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+
+        while i < len {
+            // Skip inline code spans.
+            if bytes[i] == b'`' {
+                if let Some(end) = line[i + 1..].find('`') {
+                    i += 2 + end;
+                    continue;
+                }
+            }
+
+            // ── Standard Markdown signals ────────────────────────
+            // ** (bold)
+            if i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'*' {
+                has_md = true;
+                if has_mrkdwn {
+                    return TextFormat::Mixed;
+                }
+                i += 2;
+                continue;
+            }
+            // __ (bold) — check not mid-word
+            if i + 1 < len && bytes[i] == b'_' && bytes[i + 1] == b'_' {
+                let preceded_by_alnum = i > 0 && (bytes[i - 1] as char).is_alphanumeric();
+                if !preceded_by_alnum {
+                    has_md = true;
+                    if has_mrkdwn {
+                        return TextFormat::Mixed;
+                    }
+                }
+                i += 2;
+                continue;
+            }
+            // ~~ (strikethrough)
+            if i + 1 < len && bytes[i] == b'~' && bytes[i + 1] == b'~' {
+                has_md = true;
+                if has_mrkdwn {
+                    return TextFormat::Mixed;
+                }
+                i += 2;
+                continue;
+            }
+            // [text](url) — Markdown link
+            if bytes[i] == b'[' {
+                if line[i + 1..].contains("](") {
+                    has_md = true;
+                    if has_mrkdwn {
+                        return TextFormat::Mixed;
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            // # heading (only at line start, trimmed)
+            if trimmed.starts_with('#')
+                && i == (line.len() - trimmed.len())
+                && trimmed.len() > 1
+                && (trimmed.as_bytes()[1] == b' ' || trimmed.as_bytes()[1] == b'#')
+            {
+                has_md = true;
+                if has_mrkdwn {
+                    return TextFormat::Mixed;
+                }
+                break; // rest of line is heading text
+            }
+            // - item (unordered list at line start)
+            if bytes[i] == b'-'
+                && i + 1 < len
+                && bytes[i + 1] == b' '
+                && bytes[..i].iter().all(|b| *b == b' ' || *b == b'\t')
+            {
+                has_md = true;
+                if has_mrkdwn {
+                    return TextFormat::Mixed;
+                }
+                break;
+            }
+
+            // ── Slack mrkdwn signals ─────────────────────────────
+            // <url|text> — Slack link (must contain | and start with protocol)
+            if bytes[i] == b'<' {
+                if let Some(gt_pos) = line[i + 1..].find('>') {
+                    let inner = &line[i + 1..i + 1 + gt_pos];
+                    if inner.contains('|')
+                        && (inner.starts_with("http://")
+                            || inner.starts_with("https://")
+                            || inner.starts_with("mailto:"))
+                    {
+                        has_mrkdwn = true;
+                        if has_md {
+                            return TextFormat::Mixed;
+                        }
+                    }
+                    i += 2 + gt_pos;
+                    continue;
+                }
+            }
+            // • (bullet point) — Slack-style list
+            if line[i..].starts_with('\u{2022}') {
+                has_mrkdwn = true;
+                if has_md {
+                    return TextFormat::Mixed;
+                }
+                i += '\u{2022}'.len_utf8();
+                continue;
+            }
+            // ~text~ single tilde (not ~~) — Slack strikethrough
+            if bytes[i] == b'~' && !(i + 1 < len && bytes[i + 1] == b'~') {
+                if let Some(close) = line[i + 1..].find('~') {
+                    let close_abs = i + 1 + close;
+                    let is_single_close = !(close_abs + 1 < len && bytes[close_abs + 1] == b'~');
+                    if is_single_close && close > 0 {
+                        has_mrkdwn = true;
+                        if has_md {
+                            return TextFormat::Mixed;
+                        }
+                        i = close_abs + 1;
+                        continue;
+                    }
+                }
+            }
+
+            // Advance by character.
+            let ch = line[i..].chars().next().unwrap();
+            i += ch.len_utf8();
+        }
+    }
+
+    if has_md && has_mrkdwn {
+        TextFormat::Mixed
+    } else if has_md {
+        TextFormat::StandardMarkdown
+    } else if has_mrkdwn {
+        TextFormat::SlackMrkdwn
+    } else {
+        TextFormat::Plain
+    }
+}
 
 /// Convert standard Markdown formatting to Slack mrkdwn.
 ///
-/// Handles: bold (`**` / `__`), italic (`*` → `_`), bold-italic (`***`),
-/// strikethrough (`~~`), headers (`#`), links (`[text](url)`),
-/// images (`![alt](url)`), bullet points (`-` / `*`), bare URLs, and
-/// tables.  Code blocks and inline code are preserved verbatim.
+/// Uses format detection to choose the right conversion strategy:
+/// - `StandardMarkdown`: full 4-pass conversion
+/// - `SlackMrkdwn`: safe passes only (bare URL wrapping + entity escaping)
+/// - `Mixed`: full conversion but preserves single `*text*` as-is (Slack bold)
+/// - `Plain`: entity escaping only
 fn markdown_to_slack_mrkdwn(text: &str) -> String {
     if text.is_empty() {
         return String::new();
     }
 
+    let format = detect_format(text);
+
+    match format {
+        TextFormat::SlackMrkdwn => {
+            // Already valid Slack mrkdwn — only apply safe passes.
+            let after_urls = wrap_bare_urls(text);
+            escape_slack_entities(&after_urls)
+                .trim_end_matches('\n')
+                .to_string()
+        }
+        TextFormat::Mixed => {
+            // Both formats present: full conversion but preserve *text*
+            // as Slack bold (skip single-asterisk italic rewrite).
+            convert_full(text, true)
+        }
+        TextFormat::StandardMarkdown | TextFormat::Plain => {
+            // Standard Markdown or plain text: full conversion is safe.
+            // Plain text passes through the converter harmlessly (no
+            // markers to transform), but this ensures edge cases like
+            // `---`, `\*`, bare URLs, and `* item` are still handled.
+            convert_full(text, false)
+        }
+    }
+}
+
+/// Full 4-pass conversion pipeline.
+///
+/// When `skip_single_asterisk_italic` is true (Mixed format), single `*text*`
+/// is preserved as-is instead of being converted to `_text_`.  This avoids
+/// mangling Slack bold when the LLM has already output some native mrkdwn.
+fn convert_full(text: &str, skip_single_asterisk_italic: bool) -> String {
     // ── Pass 1: per-line inline formatting ──────────────────────────
     let lines: Vec<&str> = text.split('\n').collect();
     let mut result_lines: Vec<String> = Vec::with_capacity(lines.len());
@@ -1316,14 +1569,14 @@ fn markdown_to_slack_mrkdwn(text: &str) -> String {
                 let converted = line.replacen("~~~", "```", 1);
                 result_lines.push(converted);
             } else {
-                result_lines.push(line.to_string());
+                result_lines.push((*line).to_string());
             }
             continue;
         }
 
         // Inside a fenced code block: preserve verbatim.
         if in_code_block {
-            result_lines.push(line.to_string());
+            result_lines.push((*line).to_string());
             continue;
         }
 
@@ -1351,7 +1604,7 @@ fn markdown_to_slack_mrkdwn(text: &str) -> String {
         }
 
         // ── Inline formatting ───────────────────────────────────────
-        let out = convert_inline_formatting(line);
+        let out = convert_inline_formatting_with_opts(line, skip_single_asterisk_italic);
 
         // ── Bullet points & ordered lists ───────────────────────────
         result_lines.push(convert_list_item(&out));
@@ -1375,10 +1628,21 @@ fn markdown_to_slack_mrkdwn(text: &str) -> String {
 
 /// Convert inline Markdown formatting in a single line to Slack mrkdwn.
 ///
+/// Convenience wrapper that always converts single `*text*` → `_text_`.
+fn convert_inline_formatting(line: &str) -> String {
+    convert_inline_formatting_with_opts(line, false)
+}
+
+/// Convert inline Markdown formatting in a single line to Slack mrkdwn.
+///
 /// Handles bold, italic, strikethrough, inline code, links, and images.
 /// Inline code spans are detected first and preserved verbatim so that
 /// formatting markers inside backticks are not converted.
-fn convert_inline_formatting(line: &str) -> String {
+///
+/// When `skip_single_asterisk_italic` is true (Mixed format), single
+/// `*text*` is left as-is instead of being rewritten to `_text_`.  This
+/// preserves Slack bold when the LLM has already output native mrkdwn.
+fn convert_inline_formatting_with_opts(line: &str, skip_single_asterisk_italic: bool) -> String {
     let mut out = String::with_capacity(line.len());
     let bytes = line.as_bytes();
     let len = bytes.len();
@@ -1460,6 +1724,9 @@ fn convert_inline_formatting(line: &str) -> String {
         // Standard Markdown italic (single asterisk) must become
         // Slack italic (underscore), because Slack *text* = bold.
         //
+        // When `skip_single_asterisk_italic` is true, we preserve
+        // `*text*` as-is — the LLM likely intended it as Slack bold.
+        //
         // Matching rules (mirrors CommonMark flanking delimiter):
         //   • The character after the opening `*` must be non-whitespace.
         //   • The character before the closing `*` must be non-whitespace.
@@ -1472,8 +1739,14 @@ fn convert_inline_formatting(line: &str) -> String {
                     // end > 0 ensures non-empty content; check that the
                     // character before the closing `*` is non-whitespace.
                     if end > 0 && !line.as_bytes()[i + end].is_ascii_whitespace() {
-                        let inner = &line[i + 1..i + 1 + end];
-                        let _ = write!(out, "_{inner}_");
+                        if skip_single_asterisk_italic {
+                            // Mixed mode: preserve *text* as Slack bold.
+                            let span = &line[i..i + 2 + end];
+                            out.push_str(span);
+                        } else {
+                            let inner = &line[i + 1..i + 1 + end];
+                            let _ = write!(out, "_{inner}_");
+                        }
                         i += 2 + end;
                         continue;
                     }
@@ -3046,6 +3319,178 @@ Here are the results:
             markdown_to_slack_mrkdwn("Check AT&T at [their site](https://att.com)"),
             "Check AT&amp;T at <https://att.com|their site>"
         );
+    }
+
+    // ── Format detection tests ────────────────────────────────────
+
+    #[test]
+    fn detect_format_plain_text() {
+        assert_eq!(detect_format("Hello world"), TextFormat::Plain);
+        assert_eq!(
+            detect_format("No formatting here at all."),
+            TextFormat::Plain
+        );
+    }
+
+    #[test]
+    fn detect_format_standard_markdown() {
+        assert_eq!(detect_format("**bold text**"), TextFormat::StandardMarkdown);
+        assert_eq!(detect_format("__bold text__"), TextFormat::StandardMarkdown);
+        assert_eq!(
+            detect_format("[link](https://example.com)"),
+            TextFormat::StandardMarkdown
+        );
+        assert_eq!(detect_format("## Heading"), TextFormat::StandardMarkdown);
+        assert_eq!(
+            detect_format("~~strikethrough~~"),
+            TextFormat::StandardMarkdown
+        );
+        assert_eq!(detect_format("- list item"), TextFormat::StandardMarkdown);
+    }
+
+    #[test]
+    fn detect_format_slack_mrkdwn() {
+        assert_eq!(
+            detect_format("<https://example.com|link text>"),
+            TextFormat::SlackMrkdwn
+        );
+        assert_eq!(detect_format("• bullet item"), TextFormat::SlackMrkdwn);
+        assert_eq!(
+            detect_format("~single tilde strike~"),
+            TextFormat::SlackMrkdwn
+        );
+    }
+
+    #[test]
+    fn detect_format_mixed() {
+        // Standard Markdown bold + Slack link = Mixed
+        assert_eq!(
+            detect_format("**bold** and <https://example.com|link>"),
+            TextFormat::Mixed
+        );
+        // Markdown list + Slack bullet = Mixed
+        assert_eq!(
+            detect_format("- markdown item\n• slack item"),
+            TextFormat::Mixed
+        );
+    }
+
+    #[test]
+    fn detect_format_ignores_code_blocks() {
+        // **bold** inside a code block should not count as a markdown signal.
+        let input = "```\n**bold** inside code\n```\n<https://example.com|link>";
+        assert_eq!(detect_format(input), TextFormat::SlackMrkdwn);
+    }
+
+    #[test]
+    fn detect_format_ignores_inline_code() {
+        // **bold** inside inline code should not count.
+        assert_eq!(
+            detect_format("Use `**not bold**` and <https://example.com|link>"),
+            TextFormat::SlackMrkdwn
+        );
+    }
+
+    #[test]
+    fn detect_format_ambiguous_single_star_is_plain() {
+        // *text* is ambiguous (could be MD italic or Slack bold).
+        // detect_format should not use it as a signal.
+        assert_eq!(detect_format("*ambiguous text*"), TextFormat::Plain);
+    }
+
+    #[test]
+    fn detect_format_ambiguous_underscore_is_plain() {
+        // _text_ is ambiguous (both formats use it).
+        assert_eq!(detect_format("_ambiguous text_"), TextFormat::Plain);
+    }
+
+    // ── Slack mrkdwn passthrough (format-aware) ────────────────────
+
+    #[test]
+    fn mrkdwn_slack_bold_preserved_when_native() {
+        // Pure Slack mrkdwn: *bold* should NOT be converted to _bold_.
+        let input = "<https://example.com|link> and *bold text*";
+        let output = markdown_to_slack_mrkdwn(input);
+        assert!(
+            output.contains("*bold text*"),
+            "Slack bold should be preserved in native mrkdwn: got {output}"
+        );
+        assert!(output.contains("<https://example.com|link>"));
+    }
+
+    #[test]
+    fn mrkdwn_slack_native_entity_escaping() {
+        // Slack mrkdwn with entities: & < > should still be escaped.
+        let input = "• AT&T item with <https://att.com|link>";
+        let output = markdown_to_slack_mrkdwn(input);
+        assert!(output.contains("AT&amp;T"));
+        assert!(output.contains("<https://att.com|link>"));
+    }
+
+    #[test]
+    fn mrkdwn_slack_native_bare_url_wrapped() {
+        // Slack mrkdwn with bare URL should still get wrapped.
+        let input = "• Visit https://example.com and <https://other.com|other>";
+        let output = markdown_to_slack_mrkdwn(input);
+        assert!(output.contains("<https://example.com>"));
+        assert!(output.contains("<https://other.com|other>"));
+    }
+
+    // ── Mixed format handling ──────────────────────────────────────
+
+    #[test]
+    fn mrkdwn_mixed_preserves_slack_bold_converts_md() {
+        // Mixed: **md_bold** should convert, but *slack_bold* should stay.
+        let input = "**md bold** and <https://example.com|link> and *slack bold*";
+        let output = markdown_to_slack_mrkdwn(input);
+        assert!(
+            output.contains("*md bold*"),
+            "** should convert to * in mixed mode: got {output}"
+        );
+        assert!(
+            output.contains("*slack bold*"),
+            "*text* should be preserved in mixed mode: got {output}"
+        );
+        assert!(output.contains("<https://example.com|link>"));
+    }
+
+    #[test]
+    fn mrkdwn_mixed_converts_md_links() {
+        // Mixed: markdown links should still be converted.
+        let input = "[click](https://example.com) and • item";
+        let output = markdown_to_slack_mrkdwn(input);
+        assert!(output.contains("<https://example.com|click>"));
+    }
+
+    #[test]
+    fn mrkdwn_mixed_converts_md_strikethrough() {
+        // Mixed: ~~strike~~ should still be converted.
+        let input = "~~deleted~~ and <https://example.com|link>";
+        let output = markdown_to_slack_mrkdwn(input);
+        assert!(
+            output.contains("~deleted~"),
+            "~~ should convert to ~ in mixed mode: got {output}"
+        );
+    }
+
+    // ── Idempotency / double-conversion safety ────────────────────
+
+    #[test]
+    fn mrkdwn_idempotent_on_already_converted() {
+        // Text already in Slack mrkdwn should survive a second pass.
+        let already_mrkdwn = "*bold* and _italic_ and ~strike~ and <https://example.com|link>";
+        let first = markdown_to_slack_mrkdwn(already_mrkdwn);
+        let second = markdown_to_slack_mrkdwn(&first);
+        assert_eq!(first, second, "converter should be idempotent on mrkdwn");
+    }
+
+    #[test]
+    fn mrkdwn_double_convert_standard_md_stable() {
+        // Standard Markdown converted once should survive a second pass.
+        let md = "**bold** and [link](https://example.com) and ~~strike~~";
+        let first = markdown_to_slack_mrkdwn(md);
+        let second = markdown_to_slack_mrkdwn(&first);
+        assert_eq!(first, second, "double conversion should be stable");
     }
 
     // ── Streaming / draft tests ───────────────────────────────────
