@@ -801,6 +801,22 @@ fn strip_progress_section_markers(text: &str) -> String {
     text.replace(crate::agent::loop_::DRAFT_PROGRESS_SECTION_START, "")
         .replace(crate::agent::loop_::DRAFT_PROGRESS_SECTION_END, "")
 }
+
+/// Replace the existing 🤔 Thinking… line in `accumulated` with `new_thinking`,
+/// or append if no prior Thinking line exists.
+fn replace_thinking_line(accumulated: &mut String, new_thinking: &str) {
+    let thinking_prefix = "\u{1f914} Thinking";
+    if let Some(start) = accumulated.find(thinking_prefix) {
+        let end = accumulated[start..]
+            .find('\n')
+            .map(|pos| start + pos + 1)
+            .unwrap_or(accumulated.len());
+        accumulated.replace_range(start..end, new_thinking);
+    } else {
+        accumulated.push_str(new_thinking);
+    }
+}
+
 fn build_channel_system_prompt(
     base_prompt: &str,
     channel_name: &str,
@@ -3701,6 +3717,7 @@ or tune thresholds in config.",
         let reply_target = msg.reply_target.clone();
         let draft_id = draft_id_ref.to_string();
         let mode = progress_mode;
+        let channel_name = msg.channel.clone();
         Some(tokio::spawn(async move {
             let mut accumulated = String::new();
             while let Some(delta) = rx.recv().await {
@@ -3714,6 +3731,10 @@ or tune thresholds in config.",
                     if mode == ProgressMode::Off {
                         continue;
                     }
+                    // Slack compact: hide tool progress block entirely
+                    if channel_name.eq_ignore_ascii_case("slack") && mode == ProgressMode::Compact {
+                        continue;
+                    }
                     upsert_progress_section(&mut accumulated, block);
                 } else {
                     let (is_internal_progress, visible_delta) =
@@ -3725,11 +3746,23 @@ or tune thresholds in config.",
                         if mode == ProgressMode::Compact
                             && is_verbose_only_progress_line(visible_delta)
                         {
-                            continue;
+                            // Slack compact: allow Thinking… lines through
+                            let is_thinking =
+                                visible_delta.trim_start().starts_with("\u{1f914} Thinking");
+                            if !(channel_name.eq_ignore_ascii_case("slack") && is_thinking) {
+                                continue;
+                            }
                         }
                     }
 
-                    accumulated.push_str(visible_delta);
+                    // Slack: replace previous Thinking… line instead of appending
+                    if channel_name.eq_ignore_ascii_case("slack")
+                        && visible_delta.trim_start().starts_with("\u{1f914} Thinking")
+                    {
+                        replace_thinking_line(&mut accumulated, visible_delta);
+                    } else {
+                        accumulated.push_str(visible_delta);
+                    }
                 }
                 let display_text = strip_progress_section_markers(&accumulated);
                 if let Err(e) = channel
