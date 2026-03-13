@@ -1306,10 +1306,18 @@ fn markdown_to_slack_mrkdwn(text: &str) -> String {
     for line in &lines {
         let trimmed = line.trim_start();
 
-        // Track fenced code block boundaries.
-        if trimmed.starts_with("```") {
+        // Track fenced code block boundaries (``` or ~~~).
+        // Per the Markdown spec, both backtick and tilde fences are valid.
+        // Slack only supports backtick fences, so convert ~~~ to ```.
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             in_code_block = !in_code_block;
-            result_lines.push(line.to_string());
+            if trimmed.starts_with("~~~") {
+                // Replace tilde fence with backtick fence for Slack.
+                let converted = line.replacen("~~~", "```", 1);
+                result_lines.push(converted);
+            } else {
+                result_lines.push(line.to_string());
+            }
             continue;
         }
 
@@ -1371,6 +1379,39 @@ fn convert_inline_formatting(line: &str) -> String {
     let mut i = 0;
 
     while i < len {
+        // ── Backslash escapes: \* \_ \~ etc. — emit the literal char ──
+        // Per the Markdown spec, a backslash before a punctuation
+        // character means the character should be treated literally.
+        if bytes[i] == b'\\' && i + 1 < len {
+            let next = bytes[i + 1];
+            if matches!(
+                next,
+                b'\\'
+                    | b'`'
+                    | b'*'
+                    | b'_'
+                    | b'{'
+                    | b'}'
+                    | b'['
+                    | b']'
+                    | b'<'
+                    | b'>'
+                    | b'('
+                    | b')'
+                    | b'#'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'!'
+                    | b'|'
+                    | b'~'
+            ) {
+                out.push(next as char);
+                i += 2;
+                continue;
+            }
+        }
+
         // ── Inline code: `code` — preserve verbatim ─────────────
         if bytes[i] == b'`' && !(i + 2 < len && bytes[i + 1] == b'`' && bytes[i + 2] == b'`') {
             if let Some(end) = line[i + 1..].find('`') {
@@ -1435,13 +1476,25 @@ fn convert_inline_formatting(line: &str) -> String {
         }
 
         // ── Bold: __text__ → *text* ─────────────────────────────
+        // Per CommonMark, `__` only opens emphasis at a left-flanking
+        // delimiter run that is NOT preceded by a Unicode alphanumeric.
+        // This prevents `foo__bar__baz` (mid-word) from being treated
+        // as bold, while `__init__` also stays literal.
         if i + 1 < len && bytes[i] == b'_' && bytes[i + 1] == b'_' {
-            if let Some(end) = find_closing_marker(&line[i + 2..], "__") {
-                if end > 0 {
-                    let inner = &line[i + 2..i + 2 + end];
-                    let _ = write!(out, "*{inner}*");
-                    i += 4 + end;
-                    continue;
+            let preceded_by_alnum = i > 0 && (bytes[i - 1] as char).is_alphanumeric();
+            if !preceded_by_alnum {
+                if let Some(end) = find_closing_marker(&line[i + 2..], "__") {
+                    // Also check that the closing `__` is not followed by an
+                    // alphanumeric character (right-flanking rule).
+                    let after_close = i + 2 + end + 2;
+                    let followed_by_alnum =
+                        after_close < len && (bytes[after_close] as char).is_alphanumeric();
+                    if end > 0 && !followed_by_alnum {
+                        let inner = &line[i + 2..i + 2 + end];
+                        let _ = write!(out, "*{inner}*");
+                        i += 4 + end;
+                        continue;
+                    }
                 }
             }
         }
@@ -1464,7 +1517,8 @@ fn convert_inline_formatting(line: &str) -> String {
                 let after_bracket = i + 2 + bracket_end + 1;
                 if after_bracket < len && bytes[after_bracket] == b'(' {
                     if let Some(paren_end) = line[after_bracket + 1..].find(')') {
-                        let url = &line[after_bracket + 1..after_bracket + 1 + paren_end];
+                        let raw = &line[after_bracket + 1..after_bracket + 1 + paren_end];
+                        let url = strip_link_title(raw);
                         let _ = write!(out, "<{url}>");
                         i = after_bracket + 1 + paren_end + 1;
                         continue;
@@ -1480,12 +1534,18 @@ fn convert_inline_formatting(line: &str) -> String {
                 let after_bracket = i + 1 + bracket_end + 1;
                 if after_bracket < len && bytes[after_bracket] == b'(' {
                     if let Some(paren_end) = line[after_bracket + 1..].find(')') {
-                        let url = &line[after_bracket + 1..after_bracket + 1 + paren_end];
+                        let raw = &line[after_bracket + 1..after_bracket + 1 + paren_end];
+                        let url = strip_link_title(raw);
                         if url.starts_with("http://") || url.starts_with("https://") {
                             let _ = write!(out, "<{url}|{text_part}>");
                             i = after_bracket + 1 + paren_end + 1;
                             continue;
                         }
+                        // Non-http links: emit just the link text (relative
+                        // URLs are meaningless in Slack).
+                        out.push_str(text_part);
+                        i = after_bracket + 1 + paren_end + 1;
+                        continue;
                     }
                 }
             }
@@ -1568,6 +1628,34 @@ fn convert_bold_inner(inner: &str) -> String {
         i += ch.len_utf8();
     }
     out
+}
+
+/// Strip an optional Markdown link title from the parenthesized portion of
+/// a link or image: `https://example.com "Title"` → `https://example.com`.
+///
+/// Per the Markdown spec, the title can be enclosed in double quotes (`"`),
+/// single quotes (`'`), or parentheses (`(…)`) and appears after the URL
+/// separated by whitespace.
+fn strip_link_title(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    // Detect title suffix: the last char is a quote/paren that closes a title.
+    let last = trimmed.as_bytes().last().copied();
+    let opener = match last {
+        Some(b'"') => b'"',
+        Some(b'\'') => b'\'',
+        Some(b')') => b'(',
+        _ => return trimmed,
+    };
+    // Walk backwards to find the matching opener preceded by whitespace.
+    // We search for the *last* occurrence of `opener` that is preceded by a
+    // space (to separate it from the URL).
+    let without_close = &trimmed[..trimmed.len() - 1];
+    if let Some(title_start) = without_close.rfind(opener as char) {
+        if title_start > 0 && without_close.as_bytes()[title_start - 1] == b' ' {
+            return without_close[..title_start - 1].trim_end();
+        }
+    }
+    trimmed
 }
 
 /// Check if a line is a Markdown horizontal rule: `---`, `***`, `___`
@@ -2605,6 +2693,154 @@ Here are the results:
         assert!(
             output.contains("*_Note:_*"),
             "bold-italic should be converted"
+        );
+    }
+
+    // ── Link/image title stripping ────────────────────────────────
+
+    #[test]
+    fn mrkdwn_link_with_title_stripped() {
+        // Markdown link with title attribute: title must be stripped.
+        assert_eq!(
+            markdown_to_slack_mrkdwn(r#"[Click](https://example.com "The best site")"#),
+            "<https://example.com|Click>"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_link_with_single_quote_title() {
+        assert_eq!(
+            markdown_to_slack_mrkdwn("[Click](https://example.com 'Title')"),
+            "<https://example.com|Click>"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_image_with_title_stripped() {
+        assert_eq!(
+            markdown_to_slack_mrkdwn(r#"![alt](https://img.example.com/pic.png "Caption")"#),
+            "<https://img.example.com/pic.png>"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_link_without_title_unchanged() {
+        // Links without title should still work as before.
+        assert_eq!(
+            markdown_to_slack_mrkdwn("[Click](https://example.com)"),
+            "<https://example.com|Click>"
+        );
+    }
+
+    // ── Tilde fenced code blocks ────────────────────────────────
+
+    #[test]
+    fn mrkdwn_tilde_code_block_converted() {
+        // ~~~ fences should be converted to ``` for Slack.
+        let input = "~~~rust\nfn main() {}\n~~~";
+        let output = markdown_to_slack_mrkdwn(input);
+        assert!(
+            output.contains("```rust"),
+            "tilde fence should become backtick fence"
+        );
+        assert!(
+            output.contains("fn main()"),
+            "code content should be preserved"
+        );
+        assert!(!output.contains("~~~"), "tilde fences should not remain");
+    }
+
+    #[test]
+    fn mrkdwn_tilde_code_block_no_formatting() {
+        // Content inside ~~~ blocks should not be formatted.
+        let input = "~~~\n**bold** and *italic*\n~~~";
+        let output = markdown_to_slack_mrkdwn(input);
+        assert!(
+            output.contains("**bold**"),
+            "bold should be preserved inside tilde code block"
+        );
+        assert!(
+            output.contains("*italic*"),
+            "italic should be preserved inside tilde code block"
+        );
+    }
+
+    // ── Non-http links (relative URLs) ──────────────────────────
+
+    #[test]
+    fn mrkdwn_relative_link_emits_text_only() {
+        // Relative URLs are meaningless in Slack; emit just the text.
+        assert_eq!(
+            markdown_to_slack_mrkdwn("[see docs](/api/reference)"),
+            "see docs"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_anchor_link_emits_text_only() {
+        assert_eq!(
+            markdown_to_slack_mrkdwn("[Section](#heading-id)"),
+            "Section"
+        );
+    }
+
+    // ── Backslash escapes ───────────────────────────────────────
+
+    #[test]
+    fn mrkdwn_escaped_asterisks_literal() {
+        // \* should produce a literal * and not trigger italic.
+        assert_eq!(markdown_to_slack_mrkdwn(r"\*not italic\*"), "*not italic*");
+    }
+
+    #[test]
+    fn mrkdwn_escaped_double_asterisks_literal() {
+        assert_eq!(
+            markdown_to_slack_mrkdwn(r"\*\*not bold\*\*"),
+            "**not bold**"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_escaped_underscore_literal() {
+        assert_eq!(markdown_to_slack_mrkdwn(r"\_not italic\_"), "_not italic_");
+    }
+
+    #[test]
+    fn mrkdwn_escaped_backtick_literal() {
+        assert_eq!(markdown_to_slack_mrkdwn(r"\`not code\`"), "`not code`");
+    }
+
+    #[test]
+    fn mrkdwn_escaped_backslash() {
+        assert_eq!(markdown_to_slack_mrkdwn(r"\\"), r"\");
+    }
+
+    // ── Underscore bold word-boundary ───────────────────────────
+
+    #[test]
+    fn mrkdwn_mid_word_underscores_not_bold() {
+        // Per CommonMark, mid-word __ should NOT trigger bold.
+        assert_eq!(markdown_to_slack_mrkdwn("Love__is__bold"), "Love__is__bold");
+    }
+
+    #[test]
+    fn mrkdwn_dunder_in_prose_not_bold() {
+        // Python dunder names mid-word should not be mangled.
+        // `foo.__init__` has `__` preceded by `.` (punctuation, not
+        // alphanumeric), so the opening `__` IS left-flanking per
+        // CommonMark.  But `method__init__call` is truly mid-word.
+        assert_eq!(
+            markdown_to_slack_mrkdwn("method__init__call"),
+            "method__init__call"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_underscore_bold_at_word_boundary() {
+        // __bold__ at word boundary should still convert.
+        assert_eq!(
+            markdown_to_slack_mrkdwn("Use __bold__ here"),
+            "Use *bold* here"
         );
     }
 
