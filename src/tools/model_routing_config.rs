@@ -1127,45 +1127,39 @@ impl Tool for ModelRoutingConfigTool {
                     "description": "Model for set_default/upsert_scenario/upsert_agent"
                 },
                 "temperature": {
-                    "type": ["number", "null"],
-                    "description": "Optional temperature override (0.0-2.0)"
+                    "type": "number",
+                    "description": "Optional temperature override (0.0-2.0; omit to leave unchanged)"
                 },
                 "api_key": {
-                    "type": ["string", "null"],
-                    "description": "Optional API key override for scenario route or delegate agent"
+                    "type": "string",
+                    "description": "Optional API key override for scenario route or delegate agent (omit to leave unchanged)"
                 },
                 "transport": {
-                    "type": ["string", "null"],
-                    "enum": ["auto", "websocket", "sse", "ws", "http", null],
-                    "description": "Optional route transport override for upsert_scenario (auto, websocket, sse)"
+                    "type": "string",
+                    "enum": ["auto", "websocket", "sse", "ws", "http"],
+                    "description": "Optional route transport override for upsert_scenario (omit to leave unchanged)"
                 },
                 "keywords": {
-                    "description": "Classification keywords for upsert_scenario (string or string array)",
-                    "oneOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
+                    "type": "string",
+                    "description": "Classification keywords for upsert_scenario (comma-separated string)"
                 },
                 "patterns": {
-                    "description": "Classification literal patterns for upsert_scenario (string or string array)",
-                    "oneOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
+                    "type": "string",
+                    "description": "Classification literal patterns for upsert_scenario (comma-separated string)"
                 },
                 "min_length": {
-                    "type": ["integer", "null"],
+                    "type": "integer",
                     "minimum": 0,
-                    "description": "Optional minimum message length matcher"
+                    "description": "Optional minimum message length matcher (omit to leave unchanged)"
                 },
                 "max_length": {
-                    "type": ["integer", "null"],
+                    "type": "integer",
                     "minimum": 0,
-                    "description": "Optional maximum message length matcher"
+                    "description": "Optional maximum message length matcher (omit to leave unchanged)"
                 },
                 "priority": {
-                    "type": ["integer", "null"],
-                    "description": "Priority value. For scenarios: classifier order (higher runs first). For upsert_agent: delegate selection priority."
+                    "type": "integer",
+                    "description": "Priority value. For scenarios: classifier order (higher runs first). For upsert_agent: delegate selection priority (omit to leave unchanged)."
                 },
                 "classification_enabled": {
                     "type": "boolean",
@@ -1180,40 +1174,34 @@ impl Tool for ModelRoutingConfigTool {
                     "description": "Delegate sub-agent name for upsert_agent/remove_agent"
                 },
                 "system_prompt": {
-                    "type": ["string", "null"],
-                    "description": "Optional system prompt override for delegate agent"
+                    "type": "string",
+                    "description": "Optional system prompt override for delegate agent (omit to leave unchanged)"
                 },
                 "enabled": {
                     "type": "boolean",
                     "description": "Enable or disable a delegate profile for selection/invocation"
                 },
                 "capabilities": {
-                    "description": "Capability tags for automatic agent selection (string or string array)",
-                    "oneOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
+                    "type": "string",
+                    "description": "Capability tags for automatic agent selection (comma-separated string)"
                 },
                 "max_depth": {
-                    "type": ["integer", "null"],
+                    "type": "integer",
                     "minimum": 1,
-                    "description": "Delegate max recursion depth"
+                    "description": "Delegate max recursion depth (omit to leave unchanged)"
                 },
                 "agentic": {
                     "type": "boolean",
                     "description": "Enable tool-call loop mode for delegate agent"
                 },
                 "allowed_tools": {
-                    "description": "Allowed tools for agentic delegate mode (string or string array)",
-                    "oneOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
+                    "type": "string",
+                    "description": "Allowed tools for agentic delegate mode (comma-separated string)"
                 },
                 "max_iterations": {
-                    "type": ["integer", "null"],
+                    "type": "integer",
                     "minimum": 1,
-                    "description": "Maximum tool-call iterations for agentic delegate mode"
+                    "description": "Maximum tool-call iterations for agentic delegate mode (omit to leave unchanged)"
                 },
                 "teams_enabled": {
                     "type": "boolean",
@@ -1224,34 +1212,34 @@ impl Tool for ModelRoutingConfigTool {
                     "description": "Enable/disable automatic team-agent selection when agent is omitted or 'auto'"
                 },
                 "max_team_agents": {
-                    "type": ["integer", "null"],
+                    "type": "integer",
                     "minimum": 1,
-                    "description": "Maximum number of delegate profiles activated for teams (positive integer, no hard-coded upper cap)"
+                    "description": "Maximum number of delegate profiles activated for teams (omit to leave unchanged)"
                 },
                 "teams_strategy": {
-                    "type": ["string", "null"],
-                    "enum": ["semantic", "adaptive", "least_loaded", null],
-                    "description": "Team auto-selection strategy"
+                    "type": "string",
+                    "enum": ["semantic", "adaptive", "least_loaded"],
+                    "description": "Team auto-selection strategy (omit to leave unchanged)"
                 },
                 "teams_load_window_secs": {
-                    "type": ["integer", "null"],
+                    "type": "integer",
                     "minimum": 1,
-                    "description": "Recent-event window for team load balancing (seconds)"
+                    "description": "Recent-event window for team load balancing in seconds (omit to leave unchanged)"
                 },
                 "teams_inflight_penalty": {
-                    "type": ["integer", "null"],
+                    "type": "integer",
                     "minimum": 0,
-                    "description": "Team score penalty per in-flight task"
+                    "description": "Team score penalty per in-flight task (omit to leave unchanged)"
                 },
                 "teams_recent_selection_penalty": {
-                    "type": ["integer", "null"],
+                    "type": "integer",
                     "minimum": 0,
-                    "description": "Team score penalty per recent assignment in the load window"
+                    "description": "Team score penalty per recent assignment in the load window (omit to leave unchanged)"
                 },
                 "teams_recent_failure_penalty": {
-                    "type": ["integer", "null"],
+                    "type": "integer",
                     "minimum": 0,
-                    "description": "Team score penalty per recent failure in the load window"
+                    "description": "Team score penalty per recent failure in the load window (omit to leave unchanged)"
                 },
                 "subagents_enabled": {
                     "type": "boolean",
@@ -1262,44 +1250,44 @@ impl Tool for ModelRoutingConfigTool {
                     "description": "Enable/disable automatic sub-agent selection when agent is omitted or 'auto'"
                 },
                 "max_concurrent_subagents": {
-                    "type": ["integer", "null"],
+                    "type": "integer",
                     "minimum": 1,
-                    "description": "Maximum number of concurrently running background sub-agents (positive integer, no hard-coded upper cap)"
+                    "description": "Maximum number of concurrently running background sub-agents (omit to leave unchanged)"
                 },
                 "subagents_strategy": {
-                    "type": ["string", "null"],
-                    "enum": ["semantic", "adaptive", "least_loaded", null],
-                    "description": "Sub-agent auto-selection strategy"
+                    "type": "string",
+                    "enum": ["semantic", "adaptive", "least_loaded"],
+                    "description": "Sub-agent auto-selection strategy (omit to leave unchanged)"
                 },
                 "subagents_load_window_secs": {
-                    "type": ["integer", "null"],
+                    "type": "integer",
                     "minimum": 1,
-                    "description": "Recent-event window for sub-agent load balancing (seconds)"
+                    "description": "Recent-event window for sub-agent load balancing in seconds (omit to leave unchanged)"
                 },
                 "subagents_inflight_penalty": {
-                    "type": ["integer", "null"],
+                    "type": "integer",
                     "minimum": 0,
-                    "description": "Sub-agent score penalty per in-flight task"
+                    "description": "Sub-agent score penalty per in-flight task (omit to leave unchanged)"
                 },
                 "subagents_recent_selection_penalty": {
-                    "type": ["integer", "null"],
+                    "type": "integer",
                     "minimum": 0,
-                    "description": "Sub-agent score penalty per recent assignment in the load window"
+                    "description": "Sub-agent score penalty per recent assignment in the load window (omit to leave unchanged)"
                 },
                 "subagents_recent_failure_penalty": {
-                    "type": ["integer", "null"],
+                    "type": "integer",
                     "minimum": 0,
-                    "description": "Sub-agent score penalty per recent failure in the load window"
+                    "description": "Sub-agent score penalty per recent failure in the load window (omit to leave unchanged)"
                 },
                 "subagents_queue_wait_ms": {
-                    "type": ["integer", "null"],
+                    "type": "integer",
                     "minimum": 0,
-                    "description": "How long to wait for sub-agent capacity before failing (milliseconds)"
+                    "description": "How long to wait for sub-agent capacity before failing in milliseconds (omit to leave unchanged)"
                 },
                 "subagents_queue_poll_ms": {
-                    "type": ["integer", "null"],
+                    "type": "integer",
                     "minimum": 1,
-                    "description": "Poll interval while waiting for sub-agent capacity (milliseconds)"
+                    "description": "Poll interval while waiting for sub-agent capacity in milliseconds (omit to leave unchanged)"
                 }
             },
             "additionalProperties": false

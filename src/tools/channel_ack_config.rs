@@ -607,31 +607,19 @@ impl Tool for ChannelAckConfigTool {
                     "enum": ["telegram", "discord", "lark", "feishu"]
                 },
                 "enabled": {"type": "boolean"},
-                "strategy": {"type": ["string", "null"], "enum": ["random", "first", null]},
-                "sample_rate": {"type": ["number", "null"], "minimum": 0.0, "maximum": 1.0},
-                "emojis": {
-                    "anyOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}},
-                        {"type": "null"}
-                    ]
-                },
-                "rules": {"type": ["array", "null"]},
+                "strategy": {"type": "string", "enum": ["random", "first"], "description": "Selection strategy (omit to leave unchanged)"},
+                "sample_rate": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Reaction sample rate (omit to leave unchanged)"},
+                "emojis": {"type": "string", "description": "Comma-separated emoji list or single emoji (omit to leave unchanged)"},
+                "rules": {"type": "array", "description": "Array of rule objects (omit to leave unchanged)"},
                 "rule": {"type": "object"},
                 "index": {"type": "integer", "minimum": 0},
                 "text": {"type": "string"},
-                "sender_id": {"type": ["string", "null"]},
-                "chat_id": {"type": ["string", "null"]},
+                "sender_id": {"type": "string", "description": "Sender ID filter (omit to leave unchanged)"},
+                "chat_id": {"type": "string", "description": "Chat ID filter (omit to leave unchanged)"},
                 "chat_type": {"type": "string", "enum": ["direct", "group"]},
-                "locale_hint": {"type": ["string", "null"]},
+                "locale_hint": {"type": "string", "description": "Locale hint (omit to leave unchanged)"},
                 "runs": {"type": "integer", "minimum": 1, "maximum": 1000},
-                "defaults": {
-                    "anyOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}},
-                        {"type": "null"}
-                    ]
-                }
+                "defaults": {"type": "string", "description": "Comma-separated default emoji list (omit to leave unchanged)"}
             },
             "required": ["action"]
         })

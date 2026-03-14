@@ -363,30 +363,24 @@ impl Tool for ProxyConfigTool {
                     "description": "Proxy scope: environment | zeroclaw | services"
                 },
                 "http_proxy": {
-                    "type": ["string", "null"],
-                    "description": "HTTP proxy URL"
+                    "type": "string",
+                    "description": "HTTP proxy URL (omit to leave unchanged)"
                 },
                 "https_proxy": {
-                    "type": ["string", "null"],
-                    "description": "HTTPS proxy URL"
+                    "type": "string",
+                    "description": "HTTPS proxy URL (omit to leave unchanged)"
                 },
                 "all_proxy": {
-                    "type": ["string", "null"],
-                    "description": "Fallback proxy URL for all protocols"
+                    "type": "string",
+                    "description": "Fallback proxy URL for all protocols (omit to leave unchanged)"
                 },
                 "no_proxy": {
-                    "description": "Comma-separated string or array of NO_PROXY entries",
-                    "oneOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
+                    "type": "string",
+                    "description": "Comma-separated NO_PROXY entries"
                 },
                 "services": {
-                    "description": "Comma-separated string or array of service selectors used when scope=services",
-                    "oneOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
+                    "type": "string",
+                    "description": "Comma-separated service selectors used when scope=services"
                 },
                 "clear_env": {
                     "type": "boolean",

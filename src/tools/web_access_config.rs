@@ -307,70 +307,48 @@ impl Tool for WebAccessConfigTool {
                 "require_first_visit_approval": {"type": "boolean"},
                 "enforce_domain_allowlist": {"type": "boolean"},
                 "allow_cidrs": {
-                    "anyOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
+                    "type": "string",
+                    "description": "Comma-separated CIDR allowlist"
                 },
                 "allow_domains": {
-                    "anyOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
+                    "type": "string",
+                    "description": "Comma-separated allowed domain list"
                 },
                 "domain_allowlist": {
-                    "anyOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
+                    "type": "string",
+                    "description": "Comma-separated domain allowlist"
                 },
                 "domain_blocklist": {
-                    "anyOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
+                    "type": "string",
+                    "description": "Comma-separated domain blocklist"
                 },
                 "approved_domains": {
-                    "anyOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
+                    "type": "string",
+                    "description": "Comma-separated approved domain list"
                 },
                 "add_domain_allowlist": {
-                    "anyOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
+                    "type": "string",
+                    "description": "Comma-separated domains to add to allowlist"
                 },
                 "remove_domain_allowlist": {
-                    "anyOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
+                    "type": "string",
+                    "description": "Comma-separated domains to remove from allowlist"
                 },
                 "add_domain_blocklist": {
-                    "anyOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
+                    "type": "string",
+                    "description": "Comma-separated domains to add to blocklist"
                 },
                 "remove_domain_blocklist": {
-                    "anyOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
+                    "type": "string",
+                    "description": "Comma-separated domains to remove from blocklist"
                 },
                 "add_approved_domains": {
-                    "anyOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
+                    "type": "string",
+                    "description": "Comma-separated domains to add to approved list"
                 },
                 "remove_approved_domains": {
-                    "anyOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
+                    "type": "string",
+                    "description": "Comma-separated domains to remove from approved list"
                 }
             },
             "required": ["action"]

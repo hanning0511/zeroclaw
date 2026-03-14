@@ -421,43 +421,35 @@ impl Tool for WebSearchConfigTool {
                 "enabled": {"type": "boolean"},
                 "provider": {"type": "string"},
                 "fallback_providers": {
-                    "anyOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
+                    "type": "string",
+                    "description": "Comma-separated fallback provider names"
                 },
-                "api_key": {"type": ["string", "null"]},
-                "brave_api_key": {"type": ["string", "null"]},
-                "perplexity_api_key": {"type": ["string", "null"]},
-                "exa_api_key": {"type": ["string", "null"]},
-                "jina_api_key": {"type": ["string", "null"]},
+                "api_key": {"type": "string", "description": "Provider API key (omit to leave unchanged)"},
+                "brave_api_key": {"type": "string", "description": "Brave Search API key (omit to leave unchanged)"},
+                "perplexity_api_key": {"type": "string", "description": "Perplexity API key (omit to leave unchanged)"},
+                "exa_api_key": {"type": "string", "description": "Exa API key (omit to leave unchanged)"},
+                "jina_api_key": {"type": "string", "description": "Jina API key (omit to leave unchanged)"},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 10},
                 "timeout_secs": {"type": "integer", "minimum": 1},
                 "retries_per_provider": {"type": "integer", "minimum": 0, "maximum": 5},
                 "retry_backoff_ms": {"type": "integer", "minimum": 1},
                 "domain_filter": {
-                    "anyOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
+                    "type": "string",
+                    "description": "Comma-separated domain filter list"
                 },
                 "language_filter": {
-                    "anyOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
+                    "type": "string",
+                    "description": "Comma-separated language filter list"
                 },
-                "country": {"type": ["string", "null"]},
-                "recency_filter": {"type": ["string", "null"]},
-                "max_tokens": {"type": ["integer", "null"], "minimum": 0},
-                "max_tokens_per_page": {"type": ["integer", "null"], "minimum": 0},
+                "country": {"type": "string", "description": "Country code filter (omit to leave unchanged)"},
+                "recency_filter": {"type": "string", "description": "Recency filter (omit to leave unchanged)"},
+                "max_tokens": {"type": "integer", "minimum": 0, "description": "Max tokens limit (omit to leave unchanged)"},
+                "max_tokens_per_page": {"type": "integer", "minimum": 0, "description": "Max tokens per page (omit to leave unchanged)"},
                 "exa_search_type": {"type": "string", "enum": ["auto", "keyword", "neural"]},
                 "exa_include_text": {"type": "boolean"},
                 "jina_site_filters": {
-                    "anyOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
+                    "type": "string",
+                    "description": "Comma-separated Jina site filter list"
                 }
             },
             "required": ["action"]
