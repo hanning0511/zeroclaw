@@ -4396,6 +4396,7 @@ impl<T: ChannelConfig> crate::config::traits::ConfigHandle for ConfigWrapper<T> 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ChannelsConfig {
     /// Enable the CLI interactive channel. Default: `true`.
+    #[serde(default = "default_true")]
     pub cli: bool,
     /// ACP (Agent Client Protocol) channel configuration.
     pub acp: Option<AcpConfig>,
