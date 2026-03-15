@@ -201,14 +201,33 @@ static DEFERRED_ACTION_WITHOUT_TOOL_CALL_REGEX: LazyLock<Regex> = LazyLock::new(
     .unwrap()
 });
 
-/// Detect common CJK deferred-action phrases (e.g., Chinese "让我…查看")
-/// that imply a follow-up tool call should occur.
-static CJK_DEFERRED_ACTION_CUE_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(让我|我来|我会|我们来|我们会|我先|先让我|马上)").unwrap());
+/// Detect CJK deferred-action phrases that imply a follow-up tool call should
+/// occur.  Unlike the English regex (which enforces clause-locality via
+/// `[^.!?\n]{0,160}`), the previous CJK version tested cue and verb against
+/// the **entire** response independently – causing massive false-positive rates
+/// in normal Chinese conversational replies.
+///
+/// This combined regex enforces **clause-locality**: the cue word and action
+/// verb must appear within the same short span (≤80 chars) without an
+/// intervening CJK sentence-boundary punctuation mark (。！？；\n).
+static CJK_DEFERRED_ACTION_CLAUSE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?x)
+        (让我|我来|我会|我们来|我们会|我先|先让我|马上)
+        [^。！？；\n]{0,80}
+        (查看|检查|搜索|查找|浏览|打开|读取|写入|运行|执行|调用|分析|验证|列出|获取|尝试|处理|修复)",
+    )
+    .unwrap()
+});
 
-/// Action verbs commonly used when promising to perform tool-backed work in CJK text.
-static CJK_DEFERRED_ACTION_VERB_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(查看|检查|搜索|查找|浏览|打开|读取|写入|运行|执行|调用|分析|验证|列出|获取|尝试|试试|继续|处理|修复|看看|看一看|看一下)").unwrap()
+/// Patterns that indicate the response is a conversational / completed answer
+/// rather than a deferred tool action.  When these appear we suppress the
+/// deferred-action signal to avoid false positives on discussion replies.
+static CJK_CONVERSATIONAL_ANSWER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(已经|已完成|搞定|完成了|总结|综上|以上是|整理如下|方案如下|建议如下|供参考|可以考虑|你觉得|是否可以|如何|怎么样|对吗|对不对|是不是)",
+    )
+    .unwrap()
 });
 
 /// Fast check for CJK scripts (Han/Hiragana/Katakana/Hangul) so we only run
@@ -609,9 +628,11 @@ fn looks_like_deferred_action_without_tool_call(text: &str) -> bool {
         return true;
     }
 
+    // CJK path: require cue + verb in the same clause (locality constraint)
+    // AND exclude responses that look like completed/conversational answers.
     CJK_SCRIPT_REGEX.is_match(trimmed)
-        && CJK_DEFERRED_ACTION_CUE_REGEX.is_match(trimmed)
-        && CJK_DEFERRED_ACTION_VERB_REGEX.is_match(trimmed)
+        && CJK_DEFERRED_ACTION_CLAUSE_REGEX.is_match(trimmed)
+        && !CJK_CONVERSATIONAL_ANSWER_REGEX.is_match(trimmed)
 }
 
 fn merge_continuation_text(existing: &str, next: &str) -> String {
@@ -6075,17 +6096,23 @@ Done."#;
 
     #[test]
     fn looks_like_deferred_action_without_tool_call_detects_action_promises() {
+        // English: clear intent to perform a tool action
         assert!(looks_like_deferred_action_without_tool_call(
             "Webpage opened, let's see what's new here."
         ));
         assert!(looks_like_deferred_action_without_tool_call(
             "It seems absolute paths are blocked. Let me try using a relative path."
         ));
+        // CJK: cue + verb in same clause → true positive
         assert!(looks_like_deferred_action_without_tool_call(
             "看起来绝对路径不可用，让我尝试使用当前目录的相对路径。"
         ));
         assert!(looks_like_deferred_action_without_tool_call(
             "页面已打开，让我获取快照查看详细信息。"
+        ));
+        // CJK: short imperative with tool-action intent
+        assert!(looks_like_deferred_action_without_tool_call(
+            "配置文件有误，我来修复一下。"
         ));
     }
 
@@ -6094,8 +6121,41 @@ Done."#;
         assert!(!looks_like_deferred_action_without_tool_call(
             "The latest update is already shown above."
         ));
+        // CJK: no cue word at all
         assert!(!looks_like_deferred_action_without_tool_call(
             "最新结果已经在上面整理完成。"
+        ));
+    }
+
+    #[test]
+    fn cjk_deferred_action_ignores_conversational_replies() {
+        // User asked a question; model reply uses "让我...分析" as a discourse
+        // marker, not a tool-action promise.  The conversational-answer regex
+        // should suppress the signal.
+        assert!(!looks_like_deferred_action_without_tool_call(
+            "这是个好想法，让我分析一下可行性。\n\n以上是我的建议如下：\n1. 先设计接口\n2. 再实现逻辑",
+        ));
+        // Model giving a completed summary with "已经" marker
+        assert!(!looks_like_deferred_action_without_tool_call(
+            "我来分析一下这个问题。经过检查，已经确认配置正确。",
+        ));
+        // Question-style reply ("是不是" / "可以考虑")
+        assert!(!looks_like_deferred_action_without_tool_call(
+            "让我分析一下：是不是需要先把同事加入 allowed list？你觉得这样可以考虑吗？",
+        ));
+    }
+
+    #[test]
+    fn cjk_deferred_action_requires_clause_locality() {
+        // Cue in sentence 1, verb in sentence 3 — should NOT match because
+        // the clause-locality regex requires them within 80 chars without
+        // intervening sentence boundaries.
+        assert!(!looks_like_deferred_action_without_tool_call(
+            "我来回答你的问题。\n\n首先，这个功能的设计思路是这样的。\n\n其次，我们可以查看现有的实现。"
+        ));
+        // But same cue+verb in one clause → should match
+        assert!(looks_like_deferred_action_without_tool_call(
+            "我来查看现有的实现。"
         ));
     }
 
